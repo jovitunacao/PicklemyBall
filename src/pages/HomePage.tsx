@@ -262,7 +262,7 @@ export const HomePage: React.FC = () => {
                 to={SITE_ROUTES.book}
                 className="text-sm font-semibold text-navy-800 hover:text-navy-950 whitespace-nowrap"
               >
-                Preview Stage 2 Plan &rarr;
+                Open Interactive Floor Plan &rarr;
               </Link>
             </div>
 
@@ -301,8 +301,8 @@ export const HomePage: React.FC = () => {
                   14 Courts Organized Across Three Zones
                 </h2>
                 <p className="text-sm sm:text-base text-slate-600 leading-relaxed">
-                  Exact court positions, numbering, driveways, and surrounding facilities will align
-                  1:1 to your uploaded architectural floor plan in Stage 2.
+                  Exact court positions, numbering, driveways, and surrounding facilities align 1:1
+                  to the official Astoria Regency architectural floor plan.
                 </p>
               </div>
 

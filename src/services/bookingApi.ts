@@ -504,6 +504,38 @@ export async function cancelBookingWithToken(params: {
   return parseJsonResponse<{ cancelled: boolean }>(res, false);
 }
 
+export interface ConfirmationEmailResult {
+  delivered: boolean;
+  configured: boolean;
+  provider: 'resend' | 'none';
+  recipientEmail: string;
+  subject: string;
+  reason?: string;
+  messageId?: string;
+  preview: {
+    subject: string;
+    html: string;
+    text: string;
+  };
+}
+
+export async function requestBookingConfirmationEmail(params: {
+  bookingReference: string;
+  lookupToken: string;
+  recipientEmail: string;
+}): Promise<ConfirmationEmailResult> {
+  const res = await executeFetch(
+    '/api/bookings/confirmation-email',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    },
+    false,
+  );
+  return parseJsonResponse<ConfirmationEmailResult>(res, false);
+}
+
 // ---------------------------------------------------------------------------
 // Authenticated Staff / Admin Edge Function Clients (Stage 6 Ready)
 // ---------------------------------------------------------------------------

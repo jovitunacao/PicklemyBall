@@ -1,9 +1,11 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import fs from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { sendBookingConfirmationEmail } from './server/emailService.ts';
 import {
   adminCancelReservation,
   adminCreateMaintenanceBlock,
@@ -95,7 +97,11 @@ async function publicRateLimit(req: Request, res: Response, next: NextFunction) 
   next();
 }
 
-export function createApp() {
+export interface CreateAppOptions {
+  serveStaticDir?: string;
+}
+
+export function createApp(options?: CreateAppOptions) {
   const app = express();
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '64kb' }));
@@ -263,13 +269,129 @@ export function createApp() {
     res.status(200).json(result.data);
   });
 
-  // Explicitly block unverified client-side payment confirmation in Stage 4
+  // Explicitly block unverified client-side payment confirmation until verified Stage 5 webhook evidence
   app.post('/api/bookings/:reference/confirm-payment', (_req, res) => {
     res.status(403).json({
       code: 'PAYMENT_VERIFICATION_REQUIRED',
       error:
         'Bookings cannot be confirmed without verified Stage 5 payment gateway webhook evidence.',
     });
+  });
+
+  // Token-gated transactional booking email / receipt endpoint
+  app.post('/api/bookings/confirmation-email', publicRateLimit, async (req, res) => {
+    const schema = LookupBookingSchema.extend({
+      recipientEmail: z.string().trim().email('Valid email address required').max(160),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        code: 'VALIDATION_ERROR',
+        error: parsed.error.issues[0]?.message ?? 'Booking reference, lookup token, and email are required.',
+      });
+      return;
+    }
+
+    let row: {
+      booking_reference: string;
+      court_number: number;
+      start_at: string;
+      end_at: string;
+      duration_minutes: number;
+      total_amount_centavos: number;
+      reservation_status: string;
+      payment_status: string;
+      hold_expires_at: string | null;
+      customer_name: string;
+    } | null = null;
+
+    if (isSupabaseServerConfigured()) {
+      const bookingRes = await lookupBookingSecurely({
+        bookingReference: parsed.data.bookingReference,
+        lookupToken: parsed.data.lookupToken,
+      });
+      if (!bookingRes.ok || !bookingRes.data) {
+        res.status(bookingRes.statusCode).json({
+          code: bookingRes.code,
+          error: bookingRes.error ?? 'Reservation not found.',
+        });
+        return;
+      }
+      row = bookingRes.data;
+    } else {
+      const supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim().replace(/\/+$/, '');
+      const anonKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+      if (!supabaseUrl || !anonKey) {
+        res.status(503).json({
+          code: 'SUPABASE_NOT_CONFIGURED',
+          error: 'Supabase connection is required to verify this reservation before sending email.',
+        });
+        return;
+      }
+
+      try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          apikey: anonKey,
+        };
+        if (anonKey.startsWith('eyJ')) {
+          headers.Authorization = `Bearer ${anonKey}`;
+        }
+        const edgeRes = await fetch(`${supabaseUrl}/functions/v1/booking-lookup`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            bookingReference: parsed.data.bookingReference,
+            lookupToken: parsed.data.lookupToken,
+          }),
+        });
+        const edgePayload = (await edgeRes.json().catch(() => ({}))) as Record<string, unknown>;
+        if (!edgeRes.ok) {
+          res.status(edgeRes.status).json({
+            code: typeof edgePayload.code === 'string' ? edgePayload.code : 'LOOKUP_FAILED',
+            error:
+              typeof edgePayload.error === 'string'
+                ? edgePayload.error
+                : 'Unable to verify reservation credentials.',
+          });
+          return;
+        }
+        row = edgePayload as unknown as NonNullable<typeof row>;
+      } catch {
+        res.status(502).json({
+          code: 'EDGE_LOOKUP_UNREACHABLE',
+          error: 'Unable to reach Supabase Edge Function to verify reservation for email.',
+        });
+        return;
+      }
+    }
+
+    if (!row) {
+      res.status(404).json({ code: 'NOT_FOUND', error: 'Reservation not found.' });
+      return;
+    }
+
+    const reqHost = req.headers.host;
+    const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim() || req.protocol || 'https';
+    const appBaseUrl = process.env.APP_URL?.trim() || (reqHost ? `${proto}://${reqHost}` : 'https://pickmyball.ph');
+
+    const result = await sendBookingConfirmationEmail({
+      bookingReference: row.booking_reference,
+      customerName: row.customer_name,
+      recipientEmail: parsed.data.recipientEmail,
+      courtNumber: row.court_number,
+      startAtIso: row.start_at,
+      endAtIso: row.end_at,
+      durationMinutes: row.duration_minutes,
+      totalAmountCentavos: row.total_amount_centavos,
+      reservationStatus: row.reservation_status,
+      paymentStatus: row.payment_status,
+      holdExpiresAtIso: row.hold_expires_at,
+      lookupToken: parsed.data.lookupToken,
+      appBaseUrl,
+    });
+
+    res.status(200).json(result);
   });
 
   // Staff RBAC Endpoints (Stage 4.11 Backend Foundation)
@@ -462,20 +584,46 @@ export function createApp() {
     res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
   });
 
+  // Unknown /api/* endpoints return JSON 404 instead of HTML SPA fallback
+  app.use('/api', (_req, res) => {
+    res.status(404).json({
+      code: 'API_NOT_FOUND',
+      error: 'API endpoint not found.',
+    });
+  });
+
+  if (options?.serveStaticDir) {
+    const resolvedDir = path.resolve(options.serveStaticDir);
+    const indexHtmlPath = path.join(resolvedDir, 'index.html');
+    app.use(express.static(resolvedDir));
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api')) {
+        next();
+        return;
+      }
+      // Do not serve SPA HTML for missing static asset paths with file extensions
+      if (path.extname(req.path)) {
+        res.status(404).type('text/plain').send('Asset not found');
+        return;
+      }
+      if (!fs.existsSync(indexHtmlPath)) {
+        res.status(503).type('text/plain').send('Frontend build output (dist/index.html) is not built yet.');
+        return;
+      }
+      res.sendFile(indexHtmlPath);
+    });
+  }
+
   return app;
 }
 
 async function startServer() {
-  const app = createApp();
+  const isProd = process.env.NODE_ENV === 'production';
+  const distDir = path.resolve(__dirname, 'dist');
+  const app = createApp(isProd ? { serveStaticDir: distDir } : undefined);
   const httpServer = createHttpServer(app);
 
-  if (process.env.NODE_ENV === 'production') {
-    const distDir = path.resolve(__dirname, 'dist');
-    app.use(express.static(distDir));
-    app.get('/{*splat}', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
-  } else {
+  if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {

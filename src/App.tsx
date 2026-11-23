@@ -11,12 +11,11 @@ import {
 } from './pages/FacilityPages';
 import { BookCourtPage } from './pages/BookCourtPage';
 import {
-  AdminDashboardPlaceholderPage,
-  AdminLoginPage,
   AvailabilityPage,
   ConfirmationPage,
   LookupPage,
 } from './pages/BookingFlowPages';
+import { AdminDashboardPage, AdminLoginPage } from './pages/AdminPages';
 
 export default function App() {
   return (
@@ -35,7 +34,8 @@ export default function App() {
           <Route path={SITE_ROUTES.privacy} element={<PrivacyPolicyPage />} />
           <Route path={SITE_ROUTES.terms} element={<TermsPolicyPage />} />
           <Route path={SITE_ROUTES.adminLogin} element={<AdminLoginPage />} />
-          <Route path={SITE_ROUTES.adminDashboard} element={<AdminDashboardPlaceholderPage />} />
+          <Route path={SITE_ROUTES.adminDashboard} element={<AdminDashboardPage />} />
+          <Route path={`${SITE_ROUTES.adminDashboard}/*`} element={<AdminDashboardPage />} />
           <Route path="*" element={<Navigate to={SITE_ROUTES.home} replace />} />
         </Routes>
       </Layout>

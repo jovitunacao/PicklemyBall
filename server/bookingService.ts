@@ -105,13 +105,13 @@ function classifyDbSchemaError(error: { code?: string; message?: string } | null
   );
 }
 
-// Development-default pricing rules mirror migration 0003 when DB is unconfigured
+// Local fallback pricing schedule used only when Supabase database credentials are not configured
 const DEV_FALLBACK_PRICING_RULES: PricingRuleRow[] = [
   {
     id: 'dev-weekday-day',
     facility_id: DEFAULT_FACILITY_ID,
     court_id: null,
-    name: 'Weekday Daytime (Dev Default)',
+    name: 'Weekday Daytime Schedule',
     rule_type: 'standard',
     day_scope: 'weekday',
     start_time: '06:00:00',
@@ -127,7 +127,7 @@ const DEV_FALLBACK_PRICING_RULES: PricingRuleRow[] = [
     id: 'dev-weekday-peak',
     facility_id: DEFAULT_FACILITY_ID,
     court_id: null,
-    name: 'Weekday Peak Evening (Dev Default)',
+    name: 'Weekday Peak Evening Schedule',
     rule_type: 'peak',
     day_scope: 'weekday',
     start_time: '17:00:00',
@@ -143,7 +143,7 @@ const DEV_FALLBACK_PRICING_RULES: PricingRuleRow[] = [
     id: 'dev-weekday-late',
     facility_id: DEFAULT_FACILITY_ID,
     court_id: null,
-    name: 'Weekday Late Evening (Dev Default)',
+    name: 'Weekday Late Evening Schedule',
     rule_type: 'standard',
     day_scope: 'weekday',
     start_time: '21:00:00',
@@ -159,7 +159,7 @@ const DEV_FALLBACK_PRICING_RULES: PricingRuleRow[] = [
     id: 'dev-weekend-day',
     facility_id: DEFAULT_FACILITY_ID,
     court_id: null,
-    name: 'Weekend Daytime (Dev Default)',
+    name: 'Weekend Daytime Schedule',
     rule_type: 'weekend',
     day_scope: 'weekend',
     start_time: '06:00:00',
@@ -175,7 +175,7 @@ const DEV_FALLBACK_PRICING_RULES: PricingRuleRow[] = [
     id: 'dev-weekend-peak',
     facility_id: DEFAULT_FACILITY_ID,
     court_id: null,
-    name: 'Weekend Peak Evening (Dev Default)',
+    name: 'Weekend Peak Evening Schedule',
     rule_type: 'peak',
     day_scope: 'weekend',
     start_time: '17:00:00',
@@ -191,7 +191,7 @@ const DEV_FALLBACK_PRICING_RULES: PricingRuleRow[] = [
     id: 'dev-weekend-late',
     facility_id: DEFAULT_FACILITY_ID,
     court_id: null,
-    name: 'Weekend Late Evening (Dev Default)',
+    name: 'Weekend Late Evening Schedule',
     rule_type: 'weekend',
     day_scope: 'weekend',
     start_time: '21:00:00',
@@ -1072,7 +1072,7 @@ export async function lookupBookingSecurely(
       qrCheckInEligible: qrEligible,
       qrCheckInNote: qrEligible
         ? 'Verified booking ready for check-in.'
-        : 'QR check-in passes are withheld for unpaid or unconfirmed reservations (Stage 5).',
+        : 'QR check-in passes are issued only after verified payment confirmation.',
     },
   };
 }

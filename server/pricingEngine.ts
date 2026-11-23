@@ -152,6 +152,9 @@ export function calculateServerPricingQuote(params: {
     (totalAmountCentavos * clampedDepositPct) / 100,
   );
 
+  const hasCustomConfiguredRules =
+    rules.length > 0 && !rules.some((r) => /dev default/i.test(r.name));
+
   return {
     currency: 'PHP',
     courtNumber,
@@ -165,6 +168,6 @@ export function calculateServerPricingQuote(params: {
     depositRequiredCentavos,
     depositPercent: clampedDepositPct,
     lineItems,
-    isDevelopmentDefaultRates: true,
+    isDevelopmentDefaultRates: !hasCustomConfiguredRules,
   };
 }

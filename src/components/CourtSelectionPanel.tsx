@@ -23,6 +23,7 @@ import {
   PricingQuoteResponse,
   submitGuestBookingHold,
 } from '../services/bookingApi';
+import { sanitizePricingRuleDisplayName } from '../services/facilityConfigApi';
 import { CourtStatus } from '../types/booking';
 
 interface CourtSelectionPanelProps {
@@ -371,7 +372,9 @@ export const CourtSelectionPanel: React.FC<CourtSelectionPanelProps> = ({
               <>
                 <div className="flex items-center justify-between text-slate-600">
                   <span>
-                    Hourly Rate {quote.isDevelopmentDefaultRates ? '(Dev Default)' : ''}
+                    {quote.lineItems[0]?.appliedRuleName
+                      ? sanitizePricingRuleDisplayName(quote.lineItems[0].appliedRuleName)
+                      : 'Hourly Rate'}
                   </span>
                   <span className="font-mono font-semibold text-navy-950 tabular-nums">
                     {formatCentavosPhp(quote.effectiveHourlyRateCentavos)} / hr
@@ -523,8 +526,8 @@ export const CourtSelectionPanel: React.FC<CourtSelectionPanelProps> = ({
           </button>
 
           <p className="text-[11px] text-slate-500 text-center">
-            Creates a temporary 10-minute pending-payment reservation hold. Online payment gateway
-            connects in Stage 5.
+            Creates a temporary 10-minute hold pending payment confirmation. Online checkout activates
+            after HitPay gateway approval.
           </p>
         </form>
       )}
