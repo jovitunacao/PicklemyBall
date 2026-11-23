@@ -8,9 +8,13 @@ import { createApp } from '../../server';
 import { buildConfirmationEmailContent, sendBookingConfirmationEmail } from '../../server/emailService';
 import { calculateServerPricingQuote } from '../../server/pricingEngine';
 import {
+  createInMemoryAtomicTestStore,
+  createQrCheckInManager,
+  createSupabaseQrDurabilityStore,
   issueServerQrCheckInToken,
   resetQrCheckInStoreForTests,
   revokeQrCheckInTokens,
+  validateQrCheckInSecret,
   verifyAndConsumeQrCheckInToken,
   verifySignedCheckInClaims,
 } from '../../server/qrCheckInService';
@@ -187,7 +191,7 @@ describe('QR Check-In Pass Eligibility, Server-Signed Token Isolation & SVG Rend
     resetQrCheckInStoreForTests();
   });
 
-  it('strictly unlocks QR passes only for confirmed + paid bookings', () => {
+  it('strictly unlocks QR passes only for confirmed + paid bookings', async () => {
     expect(isQrCheckInEligible('confirmed', 'paid')).toBe(true);
     expect(isQrCheckInEligible('pending_payment', 'created')).toBe(false);
     expect(isQrCheckInEligible('pending_payment', 'pending')).toBe(false);
@@ -195,7 +199,7 @@ describe('QR Check-In Pass Eligibility, Server-Signed Token Isolation & SVG Rend
     expect(isQrCheckInEligible('expired', 'expired')).toBe(false);
     expect(isQrCheckInEligible('payment_review_required', 'paid')).toBe(false);
 
-    const unpaidIssue = issueServerQrCheckInToken({
+    const unpaidIssue = await issueServerQrCheckInToken({
       bookingReference: 'PMB-20261128-AB12',
       courtNumber: 7,
       startAtIso: '2026-11-28T00:00:00.000Z',
@@ -226,7 +230,7 @@ describe('QR Check-In Pass Eligibility, Server-Signed Token Isolation & SVG Rend
 
     // Server issues a dedicated signed chk_v1 check-in token (with zero reference to lookupToken)
     const nowMs = Date.parse('2026-11-28T00:15:00.000Z');
-    const issued = issueServerQrCheckInToken({
+    const issued = await issueServerQrCheckInToken({
       bookingReference: 'PMB-20261128-AB12',
       courtNumber: 7,
       startAtIso: '2026-11-28T00:00:00.000Z',
@@ -283,7 +287,7 @@ describe('QR Check-In Pass Eligibility, Server-Signed Token Isolation & SVG Rend
   it('enforces HMAC signatures, expiry, single-use redemption, revocation, and staff auth', async () => {
     const issuedAt = Date.parse('2026-11-28T00:05:00.000Z');
     const endAt = '2026-11-28T01:00:00.000Z'; // Grace expires at 02:00:00Z
-    const issued = issueServerQrCheckInToken({
+    const issued = await issueServerQrCheckInToken({
       bookingReference: 'PMB-20261128-ZX99',
       courtNumber: 3,
       startAtIso: '2026-11-28T00:00:00.000Z',
@@ -371,7 +375,7 @@ describe('QR Check-In Pass Eligibility, Server-Signed Token Isolation & SVG Rend
     }
 
     // Separate booking token revoked by staff must be blocked (403)
-    const issued2 = issueServerQrCheckInToken({
+    const issued2 = await issueServerQrCheckInToken({
       bookingReference: 'PMB-20261128-RV01',
       courtNumber: 9,
       startAtIso: '2026-11-28T00:00:00.000Z',
@@ -417,6 +421,332 @@ describe('QR Check-In Pass Eligibility, Server-Signed Token Isolation & SVG Rend
       body: JSON.stringify({ bookingReference: 'PMB-20261128-RV01', reason: 'test' }),
     });
     expect(unauthRevoke.status).toBe(401);
+  });
+
+  it('requires a persistent, strong QR_CHECKIN_SECRET outside tests and rejects weak or missing secrets with zero fallback', async () => {
+    const missingNonTest = validateQrCheckInSecret({
+      secretOverride: '',
+      allowTestEphemeralFallback: false,
+    });
+    expect(missingNonTest.ok).toBe(false);
+    if (!missingNonTest.ok) {
+      expect(missingNonTest.statusCode).toBe(503);
+      expect(missingNonTest.code).toBe('QR_CHECKIN_SECRET_MISSING');
+    }
+
+    const shortSecret = validateQrCheckInSecret({
+      secretOverride: 'short-secret-under-32-chars',
+      allowTestEphemeralFallback: false,
+    });
+    expect(shortSecret.ok).toBe(false);
+    if (!shortSecret.ok) {
+      expect(shortSecret.statusCode).toBe(503);
+      expect(shortSecret.code).toBe('QR_CHECKIN_SECRET_WEAK');
+    }
+
+    const placeholderSecret = validateQrCheckInSecret({
+      secretOverride: 'MY_QR_CHECKIN_SECRET_PLACEHOLDER_1234567890',
+      allowTestEphemeralFallback: false,
+    });
+    expect(placeholderSecret.ok).toBe(false);
+    if (!placeholderSecret.ok) {
+      expect(placeholderSecret.code).toBe('QR_CHECKIN_SECRET_WEAK');
+    }
+
+    const lowEntropySecret = validateQrCheckInSecret({
+      secretOverride: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      allowTestEphemeralFallback: false,
+    });
+    expect(lowEntropySecret.ok).toBe(false);
+    if (!lowEntropySecret.ok) {
+      expect(lowEntropySecret.code).toBe('QR_CHECKIN_SECRET_WEAK');
+    }
+
+    // Refuses issuance & verification when non-test secret is absent
+    const prodInstanceMissingSecret = createQrCheckInManager({
+      secretOverride: '',
+      allowTestEphemeralFallback: false,
+      requireDurableStore: true,
+    });
+    const deniedIssue = await prodInstanceMissingSecret.issue({
+      bookingReference: 'PMB-20261128-N0K1',
+      courtNumber: 2,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: '2026-11-28T01:00:00.000Z',
+      reservationStatus: 'confirmed',
+      paymentStatus: 'paid',
+      nowMs: Date.parse('2026-11-28T00:15:00.000Z'),
+    });
+    expect(deniedIssue.ok).toBe(false);
+    if (!deniedIssue.ok) {
+      expect(deniedIssue.statusCode).toBe(503);
+      expect(deniedIssue.code).toBe('QR_CHECKIN_SECRET_MISSING');
+    }
+
+    // Fails closed if durable Supabase client/store is missing outside test fallback
+    const strongSecret = 'pK9xR2vQ7mZ4wL8nB3cT6yF1jH5dG0sA_9eW2qU7i';
+    const prodInstanceMissingDb = createQrCheckInManager({
+      secretOverride: strongSecret,
+      allowTestEphemeralFallback: false,
+      durabilityStore: null,
+      requireDurableStore: true,
+    });
+    const issued = await prodInstanceMissingDb.issue({
+      bookingReference: 'PMB-20261128-N0D8',
+      courtNumber: 2,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: '2026-11-28T01:00:00.000Z',
+      reservationStatus: 'confirmed',
+      paymentStatus: 'paid',
+      nowMs: Date.parse('2026-11-28T00:15:00.000Z'),
+    });
+    expect(issued.ok).toBe(true);
+    if (!issued.ok) return;
+
+    const verifyNoDb = await prodInstanceMissingDb.verifyOrRedeem({
+      qrPayloadOrToken: issued.data.qrPayload,
+      staffUserId: 'staff-1',
+      nowMs: Date.parse('2026-11-28T00:20:00.000Z'),
+    });
+    expect(verifyNoDb.ok).toBe(false);
+    if (!verifyNoDb.ok) {
+      expect(verifyNoDb.statusCode).toBe(503);
+      expect(verifyNoDb.code).toBe('DURABLE_STORE_UNAVAILABLE');
+    }
+  });
+
+  it('survives restarts & multi-instance Cloud Run scaling, serializes concurrent redemptions, and propagates revocations', async () => {
+    const persistentSecret = 'X7nP4qK9vR2mL8wB5cT1yF6jH3dG0sA_4zW9eU2i';
+    const otherSecret = 'M3bV8cZ5xN1kJ7hG4fD9sA2pO6iU0yT_8rE3wQ5z';
+    const nowMs = Date.parse('2026-11-28T00:15:00.000Z');
+
+    const sharedDbStore = createInMemoryAtomicTestStore([
+      {
+        bookingReference: 'PMB-20261128-RACE',
+        courtNumber: 5,
+        customerName: 'Multi Instance Player',
+        status: 'confirmed',
+        paymentStatus: 'paid',
+        startAtIso: '2026-11-28T00:00:00.000Z',
+        endAtIso: '2026-11-28T02:00:00.000Z',
+      },
+      {
+        bookingReference: 'PMB-20261128-REVK',
+        courtNumber: 6,
+        customerName: 'Revoked Player',
+        status: 'confirmed',
+        paymentStatus: 'paid',
+        startAtIso: '2026-11-28T00:00:00.000Z',
+        endAtIso: '2026-11-28T02:00:00.000Z',
+      },
+    ]);
+
+    // Cloud Run Instance A issues QR pass, then disappears (process restart / different replica)
+    const instanceA = createQrCheckInManager({
+      secretOverride: persistentSecret,
+      allowTestEphemeralFallback: false,
+      durabilityStore: sharedDbStore,
+      requireDurableStore: true,
+    });
+    const issuedRace = await instanceA.issue({
+      bookingReference: 'PMB-20261128-RACE',
+      courtNumber: 5,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: '2026-11-28T02:00:00.000Z',
+      reservationStatus: 'confirmed',
+      paymentStatus: 'paid',
+      nowMs,
+    });
+    expect(issuedRace.ok).toBe(true);
+    if (!issuedRace.ok) return;
+
+    // Fresh Instance B & Instance C (no shared local memory, only shared secret + shared durable DB)
+    const instanceB = createQrCheckInManager({
+      secretOverride: persistentSecret,
+      allowTestEphemeralFallback: false,
+      durabilityStore: sharedDbStore,
+      requireDurableStore: true,
+    });
+    const instanceWithWrongSecret = createQrCheckInManager({
+      secretOverride: otherSecret,
+      allowTestEphemeralFallback: false,
+      durabilityStore: sharedDbStore,
+      requireDurableStore: true,
+    });
+
+    // Wrong persistent secret must fail signature verification
+    const mismatchRes = await instanceWithWrongSecret.verifyOrRedeem({
+      qrPayloadOrToken: issuedRace.data.qrPayload,
+      staffUserId: 'staff-c',
+      nowMs: nowMs + 1000,
+    });
+    expect(mismatchRes.ok).toBe(false);
+    if (!mismatchRes.ok) {
+      expect(mismatchRes.statusCode).toBe(401);
+      expect(mismatchRes.code).toBe('INVALID_CHECKIN_SIGNATURE');
+    }
+
+    // 12 concurrent redemption requests fired simultaneously across Instance A and Instance B
+    const concurrentAttempts = Array.from({ length: 12 }, (_, idx) => {
+      const targetInstance = idx % 2 === 0 ? instanceA : instanceB;
+      return targetInstance.verifyOrRedeem({
+        qrPayloadOrToken: issuedRace.data.qrPayload,
+        consume: true,
+        staffUserId: `staff-${idx}`,
+        nowMs: nowMs + 2000 + idx,
+      });
+    });
+
+    const results = await Promise.all(concurrentAttempts);
+    const winners = results.filter((r) => r.ok && r.data.consumed);
+    const conflicts = results.filter((r) => !r.ok && r.code === 'CHECKIN_ALREADY_REDEEMED');
+
+    expect(winners).toHaveLength(1);
+    expect(conflicts).toHaveLength(11);
+    expect(sharedDbStore.getRedemptionCount('PMB-20261128-RACE')).toBe(1);
+
+    // Instance B also blocks issuing a new pass after Instance A/B already redeemed the booking
+    const postRedeemIssue = await instanceB.issue({
+      bookingReference: 'PMB-20261128-RACE',
+      courtNumber: 5,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: '2026-11-28T02:00:00.000Z',
+      reservationStatus: 'confirmed',
+      paymentStatus: 'paid',
+      nowMs: nowMs + 5000,
+    });
+    expect(postRedeemIssue.ok).toBe(false);
+    if (!postRedeemIssue.ok) {
+      expect(postRedeemIssue.statusCode).toBe(409);
+      expect(postRedeemIssue.code).toBe('CHECKIN_ALREADY_REDEEMED');
+    }
+
+    // Durable revocation propagated across Cloud Run instances
+    const issuedRevk = await instanceA.issue({
+      bookingReference: 'PMB-20261128-REVK',
+      courtNumber: 6,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: '2026-11-28T02:00:00.000Z',
+      reservationStatus: 'confirmed',
+      paymentStatus: 'paid',
+      nowMs,
+    });
+    expect(issuedRevk.ok).toBe(true);
+    if (!issuedRevk.ok) return;
+
+    const revOnA = await instanceA.revoke({
+      bookingReference: 'PMB-20261128-REVK',
+      reason: 'cancelled_by_manager',
+      permanent: true,
+      staffUserId: 'manager-1',
+      nowMs: nowMs + 1000,
+    });
+    expect(revOnA.ok).toBe(true);
+
+    const scanOnB = await instanceB.verifyOrRedeem({
+      qrPayloadOrToken: issuedRevk.data.qrPayload,
+      consume: true,
+      staffUserId: 'staff-b',
+      nowMs: nowMs + 2000,
+    });
+    expect(scanOnB.ok).toBe(false);
+    if (!scanOnB.ok) {
+      expect(scanOnB.statusCode).toBe(403);
+      expect(scanOnB.code).toBe('CHECKIN_TOKEN_REVOKED');
+    }
+
+    const reissueOnB = await instanceB.issue({
+      bookingReference: 'PMB-20261128-REVK',
+      courtNumber: 6,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: '2026-11-28T02:00:00.000Z',
+      reservationStatus: 'confirmed',
+      paymentStatus: 'paid',
+      nowMs: nowMs + 3000,
+    });
+    expect(reissueOnB.ok).toBe(false);
+    if (!reissueOnB.ok) {
+      expect(reissueOnB.statusCode).toBe(403);
+      expect(reissueOnB.code).toBe('CHECKIN_TOKEN_REVOKED');
+    }
+  });
+
+  it('calls PostgreSQL RPCs in SupabaseQrDurabilityStore and fails closed cleanly if Migration 0005 is not applied yet', async () => {
+    const missingRpcClient = {
+      rpc: async () => ({
+        data: null,
+        error: { code: 'PGRST202', message: 'Could not find the function public.verify_or_redeem_qr_checkin' },
+      }),
+    } as unknown as Parameters<typeof createSupabaseQrDurabilityStore>[0];
+
+    const missingStore = createSupabaseQrDurabilityStore(missingRpcClient);
+    const verifyMissing = await missingStore.verifyOrRedeem({
+      facilityId: '11111111-1111-4111-8111-111111111101',
+      bookingReference: 'PMB-20261128-SQL5',
+      courtNumber: 1,
+      tokenJti: 'jti-1234567890',
+      issuedAtEpoch: 1795824000,
+      expiresAtIso: '2026-11-28T02:00:00.000Z',
+      consume: true,
+      staffUserId: 'staff-uuid',
+      nowMs: Date.parse('2026-11-28T00:15:00.000Z'),
+    });
+    expect(verifyMissing.ok).toBe(false);
+    if (!verifyMissing.ok) {
+      expect(verifyMissing.statusCode).toBe(503);
+      expect(verifyMissing.code).toBe('QR_CHECKIN_MIGRATION_REQUIRED');
+    }
+
+    const recordedCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+    const okRpcClient = {
+      rpc: async (fn: string, args: Record<string, unknown>) => {
+        recordedCalls.push({ fn, args });
+        if (fn === 'verify_or_redeem_qr_checkin') {
+          return {
+            data: [
+              {
+                ok: true,
+                status_code: 200,
+                code: 'OK',
+                error_message: null,
+                consumed: true,
+                booking_reference: 'PMB-20261128-SQL5',
+                court_number: 4,
+                customer_name: 'Ana Reyes',
+                reservation_status: 'confirmed',
+                start_at: '2026-11-28T00:00:00.000Z',
+                end_at: '2026-11-28T01:00:00.000Z',
+                checked_in_at: '2026-11-28T00:15:00.000Z',
+              },
+            ],
+            error: null,
+          };
+        }
+        return { data: [], error: null };
+      },
+    } as unknown as Parameters<typeof createSupabaseQrDurabilityStore>[0];
+
+    const supabaseStore = createSupabaseQrDurabilityStore(okRpcClient);
+    const rpcRes = await supabaseStore.verifyOrRedeem({
+      facilityId: '11111111-1111-4111-8111-111111111101',
+      bookingReference: 'PMB-20261128-SQL5',
+      courtNumber: 4,
+      tokenJti: 'jti-1234567890',
+      issuedAtEpoch: 1795824000,
+      expiresAtIso: '2026-11-28T02:00:00.000Z',
+      consume: true,
+      staffUserId: 'staff-uuid',
+      nowMs: Date.parse('2026-11-28T00:15:00.000Z'),
+    });
+
+    expect(recordedCalls).toHaveLength(1);
+    expect(recordedCalls[0].fn).toBe('verify_or_redeem_qr_checkin');
+    expect(rpcRes.ok).toBe(true);
+    if (rpcRes.ok) {
+      expect(rpcRes.data.consumed).toBe(true);
+      expect(rpcRes.data.customerName).toBe('Ana Reyes');
+      expect(rpcRes.data.courtNumber).toBe(4);
+    }
   });
 });
 

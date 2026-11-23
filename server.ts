@@ -8,7 +8,9 @@ import { z } from 'zod';
 import { sendBookingConfirmationEmail } from './server/emailService.ts';
 import {
   issueServerQrCheckInToken,
+  isTestRuntime,
   revokeQrCheckInTokens,
+  validateQrCheckInSecret,
   verifyAndConsumeQrCheckInToken,
 } from './server/qrCheckInService.ts';
 import {
@@ -150,6 +152,7 @@ export function createApp(options?: CreateAppOptions) {
 
   app.get('/api/health', (_req, res) => {
     const diag = diagnoseServerSupabaseConfig();
+    const qrSecretDiag = validateQrCheckInSecret();
     res.json({
       status: 'ok',
       stage: 'stage-4',
@@ -157,10 +160,12 @@ export function createApp(options?: CreateAppOptions) {
       currency: 'PHP',
       supabaseConfigured: isSupabaseServerConfigured(),
       supabaseConfigState: diag.state,
+      qrCheckInSecretConfigured: qrSecretDiag.ok && qrSecretDiag.data.isPersistent,
       envPresence: {
         SUPABASE_URL: diag.hasUrl,
         SUPABASE_ANON_KEY: diag.hasAnonKey,
         SUPABASE_SERVICE_ROLE_KEY: diag.hasServiceRoleKey,
+        QR_CHECKIN_SECRET: Boolean(process.env.QR_CHECKIN_SECRET?.trim()),
       },
       paymentGatewayEnabled: false,
     });
@@ -271,12 +276,15 @@ export function createApp(options?: CreateAppOptions) {
       res.status(result.statusCode).json({ code: result.code, error: result.error });
       return;
     }
-    await revokeQrCheckInTokens({
-      bookingReference: req.params.reference,
-      reason: 'reservation_cancelled',
-      permanent: true,
-      adminClient: getSupabaseAdminClient(),
-    });
+    const cancelAdminClient = getSupabaseAdminClient();
+    if (cancelAdminClient || isTestRuntime()) {
+      await revokeQrCheckInTokens({
+        bookingReference: req.params.reference,
+        reason: 'reservation_cancelled',
+        permanent: true,
+        adminClient: cancelAdminClient,
+      });
+    }
     res.status(200).json(result.data);
   });
 
@@ -371,6 +379,15 @@ export function createApp(options?: CreateAppOptions) {
 
   // Dedicated server-generated QR check-in token issuance (never embeds lookupToken)
   app.post('/api/qr-checkin/issue', publicRateLimit, async (req, res) => {
+    const secretStatus = validateQrCheckInSecret();
+    if (!secretStatus.ok) {
+      res.status(secretStatus.statusCode).json({
+        code: secretStatus.code,
+        error: secretStatus.error,
+      });
+      return;
+    }
+
     const parsed = LookupBookingSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({
@@ -390,13 +407,14 @@ export function createApp(options?: CreateAppOptions) {
     }
 
     const row = verified.row;
-    const issued = issueServerQrCheckInToken({
+    const issued = await issueServerQrCheckInToken({
       bookingReference: row.booking_reference,
       courtNumber: row.court_number,
       startAtIso: row.start_at,
       endAtIso: row.end_at,
       reservationStatus: row.reservation_status as Parameters<typeof issueServerQrCheckInToken>[0]['reservationStatus'],
       paymentStatus: row.payment_status as Parameters<typeof issueServerQrCheckInToken>[0]['paymentStatus'],
+      adminClient: getSupabaseAdminClient(),
     });
 
     if (!issued.ok) {
@@ -516,6 +534,7 @@ export function createApp(options?: CreateAppOptions) {
         reason: 'reservation_cancelled',
         permanent: true,
         staffUserId: auth.staff.userId,
+        dbClient: auth.staff.dbClient,
         adminClient: auth.staff.adminClient,
       });
     }
@@ -598,6 +617,7 @@ export function createApp(options?: CreateAppOptions) {
       reason: parsed.data.reason,
       permanent: Boolean(parsed.data.permanent && allowPermanent),
       staffUserId: auth.staff.userId,
+      dbClient: auth.staff.dbClient,
       adminClient: auth.staff.adminClient,
     });
     res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
@@ -790,6 +810,12 @@ async function startServer() {
 
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Pick My Ball server listening on http://0.0.0.0:${PORT}`);
+    if (!isTestRuntime()) {
+      const secretCheck = validateQrCheckInSecret();
+      if (!secretCheck.ok) {
+        console.warn(`[QR Check-In Security] ${secretCheck.code}: ${secretCheck.error}`);
+      }
+    }
   });
 }
 

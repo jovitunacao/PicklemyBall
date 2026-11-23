@@ -20,6 +20,10 @@ const edgeRemediationSql = fs.readFileSync(
   path.join(MIGRATION_DIR, '202611230004_serverless_rate_limits_and_admin_rpcs.sql'),
   'utf8',
 );
+const qrDurabilitySql = fs.readFileSync(
+  path.join(MIGRATION_DIR, '202611230005_qr_checkin_durability.sql'),
+  'utf8',
+);
 
 describe('Stage 3 SQL Migrations Static Integrity & Security Audit', () => {
   const requiredTables = [
@@ -148,6 +152,38 @@ describe('Stage 3 SQL Migrations Static Integrity & Security Audit', () => {
     );
     expect(availFn).toContain('FACILITY_NOT_FOUND');
     expect(availFn).toContain("res.hold_id IS NULL");
+  });
+
+  it('defines durable QR redemptions, revocations, RLS, FOR UPDATE serialization, and pinned search_path in Migration 0005', () => {
+    expect(qrDurabilitySql).toContain('CREATE TABLE IF NOT EXISTS qr_checkin_redemptions');
+    expect(qrDurabilitySql).toContain('CREATE TABLE IF NOT EXISTS qr_checkin_revocations');
+    expect(qrDurabilitySql).toContain('ALTER TABLE qr_checkin_redemptions ENABLE ROW LEVEL SECURITY');
+    expect(qrDurabilitySql).toContain('ALTER TABLE qr_checkin_revocations ENABLE ROW LEVEL SECURITY');
+    expect(qrDurabilitySql).toContain('reservation_id UUID NOT NULL UNIQUE');
+    expect(qrDurabilitySql).toContain('token_jti TEXT NOT NULL UNIQUE');
+    expect(qrDurabilitySql).toContain('FOR UPDATE OF r');
+    expect(qrDurabilitySql).toContain('ON CONFLICT DO NOTHING');
+    expect(qrDurabilitySql).toContain('trg_reservations_auto_revoke_qr');
+
+    const mig5Defs = [
+      ...qrDurabilitySql.matchAll(/CREATE OR REPLACE FUNCTION\s+([a-zA-Z0-9_]+)\s*\(/g),
+    ];
+    expect(mig5Defs.map((m) => m[1])).toEqual([
+      'check_qr_checkin_issuance_eligibility',
+      'verify_or_redeem_qr_checkin',
+      'revoke_qr_checkin_pass',
+      'auto_revoke_qr_checkin_on_cancel',
+    ]);
+    for (const fnName of [
+      'check_qr_checkin_issuance_eligibility',
+      'verify_or_redeem_qr_checkin',
+      'revoke_qr_checkin_pass',
+    ]) {
+      expect(qrDurabilitySql).toContain(`REVOKE ALL ON FUNCTION ${fnName}`);
+      expect(qrDurabilitySql).toContain(`GRANT EXECUTE ON FUNCTION ${fnName}`);
+    }
+    const mig5SearchPaths = qrDurabilitySql.match(/SET search_path = public, pg_temp/g) ?? [];
+    expect(mig5SearchPaths).toHaveLength(4);
   });
 });
 
