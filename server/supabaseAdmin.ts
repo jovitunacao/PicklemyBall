@@ -152,6 +152,8 @@ export function getSupabaseAdminClient(): SupabaseClient | null {
 export interface VerifiedStaffContext {
   userId: string;
   profile: StaffProfileRow;
+  dbClient: SupabaseClient;
+  adminClient: SupabaseClient | null;
 }
 
 /**
@@ -165,16 +167,6 @@ export async function verifyStaffAuthorization(
   | { ok: true; staff: VerifiedStaffContext }
   | { ok: false; statusCode: number; error: string }
 > {
-  const diag = diagnoseServerSupabaseConfig();
-  const admin = getSupabaseAdminClient();
-  if (!admin) {
-    return {
-      ok: false,
-      statusCode: 503,
-      error: `${diag.state.toUpperCase()}: ${diag.message}`,
-    };
-  }
-
   if (!authorizationHeader || !authorizationHeader.startsWith('Bearer ')) {
     return {
       ok: false,
@@ -192,7 +184,37 @@ export async function verifyStaffAuthorization(
     };
   }
 
-  const { data: userData, error: authError } = await admin.auth.getUser(token);
+  const diag = diagnoseServerSupabaseConfig();
+  const admin = getSupabaseAdminClient();
+
+  let verificationClient: SupabaseClient | null = admin;
+  if (!verificationClient) {
+    const url = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim().replace(/\/+$/, '');
+    const anonKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+    if (url && anonKey && isValidSupabaseApiUrl(url).valid) {
+      verificationClient = createClient(url, anonKey, {
+        global: {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+        },
+      });
+    }
+  }
+
+  if (!verificationClient) {
+    return {
+      ok: false,
+      statusCode: 503,
+      error: `${diag.state.toUpperCase()}: ${diag.message}`,
+    };
+  }
+
+  const { data: userData, error: authError } = await verificationClient.auth.getUser(token);
   if (authError || !userData?.user) {
     return {
       ok: false,
@@ -201,7 +223,7 @@ export async function verifyStaffAuthorization(
     };
   }
 
-  const { data: profile, error: profileError } = await admin
+  const { data: profile, error: profileError } = await verificationClient
     .from('staff_profiles')
     .select('*')
     .eq('id', userData.user.id)
@@ -229,6 +251,8 @@ export async function verifyStaffAuthorization(
     staff: {
       userId: userData.user.id,
       profile,
+      dbClient: verificationClient,
+      adminClient: admin,
     },
   };
 }

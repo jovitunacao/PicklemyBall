@@ -313,8 +313,21 @@ async function parseJsonResponse<T>(res: Response, isEdgeCall: boolean = false):
           ? payload.message
           : `Request failed (${res.status})`;
 
-    // Pass validation errors (400) and conflict errors (409) directly as ApiError
-    if (res.status === 400 || res.status === 409) {
+    // Pass validation, auth, conflict, not-found, expired, and QR check-in errors directly as ApiError
+    if (
+      res.status === 400 ||
+      res.status === 404 ||
+      res.status === 409 ||
+      res.status === 410 ||
+      code === 'QR_NOT_ELIGIBLE' ||
+      code === 'INVALID_CHECKIN_SIGNATURE' ||
+      code === 'CHECKIN_TOKEN_REVOKED' ||
+      code === 'CHECKIN_ALREADY_REDEEMED' ||
+      code === 'RESERVATION_NOT_CONFIRMED' ||
+      code === 'UNSUPPORTED_LEGACY_QR_FORMAT' ||
+      code === 'FORBIDDEN' ||
+      (!isEdgeCall && (res.status === 401 || res.status === 403))
+    ) {
       throw new ApiError(message, res.status, code);
     }
 
@@ -534,6 +547,95 @@ export async function requestBookingConfirmationEmail(params: {
     false,
   );
   return parseJsonResponse<ConfirmationEmailResult>(res, false);
+}
+
+export interface IssuedQrCheckInResponse {
+  checkInToken: string;
+  jti: string;
+  bookingReference: string;
+  courtNumber: number;
+  issuedAtIso: string;
+  expiresAtIso: string;
+  qrPayload: string;
+}
+
+export async function issueQrCheckInPass(params: {
+  bookingReference: string;
+  lookupToken: string;
+}): Promise<IssuedQrCheckInResponse> {
+  const res = await executeFetch(
+    '/api/qr-checkin/issue',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    },
+    false,
+  );
+  return parseJsonResponse<IssuedQrCheckInResponse>(res, false);
+}
+
+export interface QrCheckInVerifyResponse {
+  valid: boolean;
+  consumed: boolean;
+  bookingReference: string;
+  courtNumber: number;
+  customerName: string | null;
+  reservationStatus: ReservationStatusDb;
+  startAtIso: string | null;
+  endAtIso: string | null;
+  tokenJti: string;
+  expiresAtIso: string;
+  checkedInAtIso: string | null;
+  message: string;
+}
+
+export async function adminVerifyQrCheckIn(
+  staffAccessToken: string,
+  params: { qrPayloadOrToken: string; consume?: boolean },
+): Promise<QrCheckInVerifyResponse> {
+  const res = await executeFetch(
+    '/api/admin/check-in/verify',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify(params),
+    },
+    false,
+  );
+  return parseJsonResponse<QrCheckInVerifyResponse>(res, false);
+}
+
+export async function adminRevokeQrCheckIn(
+  staffAccessToken: string,
+  params: {
+    bookingReference?: string;
+    qrPayloadOrToken?: string;
+    reason: string;
+    permanent?: boolean;
+  },
+): Promise<{
+  revoked: boolean;
+  bookingReference: string | null;
+  tokenJti: string | null;
+  revokedAtIso: string;
+}> {
+  const res = await executeFetch(
+    '/api/admin/check-in/revoke',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify(params),
+    },
+    false,
+  );
+  return parseJsonResponse(res, false);
 }
 
 // ---------------------------------------------------------------------------

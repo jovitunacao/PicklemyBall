@@ -7,6 +7,11 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { sendBookingConfirmationEmail } from './server/emailService.ts';
 import {
+  issueServerQrCheckInToken,
+  revokeQrCheckInTokens,
+  verifyAndConsumeQrCheckInToken,
+} from './server/qrCheckInService.ts';
+import {
   adminCancelReservation,
   adminCreateMaintenanceBlock,
   adminCreatePricingRule,
@@ -266,6 +271,12 @@ export function createApp(options?: CreateAppOptions) {
       res.status(result.statusCode).json({ code: result.code, error: result.error });
       return;
     }
+    await revokeQrCheckInTokens({
+      bookingReference: req.params.reference,
+      reason: 'reservation_cancelled',
+      permanent: true,
+      adminClient: getSupabaseAdminClient(),
+    });
     res.status(200).json(result.data);
   });
 
@@ -276,6 +287,124 @@ export function createApp(options?: CreateAppOptions) {
       error:
         'Bookings cannot be confirmed without verified Stage 5 payment gateway webhook evidence.',
     });
+  });
+
+  interface VerifiedLookupRecord {
+    booking_reference: string;
+    court_number: number;
+    start_at: string;
+    end_at: string;
+    duration_minutes: number;
+    total_amount_centavos: number;
+    reservation_status: string;
+    payment_status: string;
+    hold_expires_at: string | null;
+    customer_name: string;
+  }
+
+  async function verifyBookingOwnershipServerSide(params: {
+    bookingReference: string;
+    lookupToken: string;
+  }): Promise<
+    | { ok: true; row: VerifiedLookupRecord }
+    | { ok: false; statusCode: number; code: string; error: string }
+  > {
+    if (isSupabaseServerConfigured()) {
+      const bookingRes = await lookupBookingSecurely(params);
+      if (!bookingRes.ok || !bookingRes.data) {
+        return {
+          ok: false,
+          statusCode: bookingRes.statusCode,
+          code: bookingRes.code ?? 'LOOKUP_FAILED',
+          error: bookingRes.error ?? 'Reservation not found.',
+        };
+      }
+      return { ok: true, row: bookingRes.data };
+    }
+
+    const supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim().replace(/\/+$/, '');
+    const anonKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+    if (!supabaseUrl || !anonKey) {
+      return {
+        ok: false,
+        statusCode: 503,
+        code: 'SUPABASE_NOT_CONFIGURED',
+        error: 'Supabase connection is required to verify this reservation.',
+      };
+    }
+
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        apikey: anonKey,
+      };
+      if (anonKey.startsWith('eyJ')) {
+        headers.Authorization = `Bearer ${anonKey}`;
+      }
+      const edgeRes = await fetch(`${supabaseUrl}/functions/v1/booking-lookup`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(params),
+      });
+      const edgePayload = (await edgeRes.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!edgeRes.ok) {
+        return {
+          ok: false,
+          statusCode: edgeRes.status,
+          code: typeof edgePayload.code === 'string' ? edgePayload.code : 'LOOKUP_FAILED',
+          error:
+            typeof edgePayload.error === 'string'
+              ? edgePayload.error
+              : 'Unable to verify reservation credentials.',
+        };
+      }
+      return { ok: true, row: edgePayload as unknown as VerifiedLookupRecord };
+    } catch {
+      return {
+        ok: false,
+        statusCode: 502,
+        code: 'EDGE_LOOKUP_UNREACHABLE',
+        error: 'Unable to reach Supabase Edge Function to verify reservation.',
+      };
+    }
+  }
+
+  // Dedicated server-generated QR check-in token issuance (never embeds lookupToken)
+  app.post('/api/qr-checkin/issue', publicRateLimit, async (req, res) => {
+    const parsed = LookupBookingSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        code: 'VALIDATION_ERROR',
+        error: parsed.error.issues[0]?.message ?? 'Booking reference and access token are required.',
+      });
+      return;
+    }
+
+    const verified = await verifyBookingOwnershipServerSide({
+      bookingReference: parsed.data.bookingReference,
+      lookupToken: parsed.data.lookupToken,
+    });
+    if (!verified.ok) {
+      res.status(verified.statusCode).json({ code: verified.code, error: verified.error });
+      return;
+    }
+
+    const row = verified.row;
+    const issued = issueServerQrCheckInToken({
+      bookingReference: row.booking_reference,
+      courtNumber: row.court_number,
+      startAtIso: row.start_at,
+      endAtIso: row.end_at,
+      reservationStatus: row.reservation_status as Parameters<typeof issueServerQrCheckInToken>[0]['reservationStatus'],
+      paymentStatus: row.payment_status as Parameters<typeof issueServerQrCheckInToken>[0]['paymentStatus'],
+    });
+
+    if (!issued.ok) {
+      res.status(issued.statusCode).json({ code: issued.code, error: issued.error });
+      return;
+    }
+
+    res.status(200).json(issued.data);
   });
 
   // Token-gated transactional booking email / receipt endpoint
@@ -292,85 +421,19 @@ export function createApp(options?: CreateAppOptions) {
       return;
     }
 
-    let row: {
-      booking_reference: string;
-      court_number: number;
-      start_at: string;
-      end_at: string;
-      duration_minutes: number;
-      total_amount_centavos: number;
-      reservation_status: string;
-      payment_status: string;
-      hold_expires_at: string | null;
-      customer_name: string;
-    } | null = null;
-
-    if (isSupabaseServerConfigured()) {
-      const bookingRes = await lookupBookingSecurely({
-        bookingReference: parsed.data.bookingReference,
-        lookupToken: parsed.data.lookupToken,
+    const verified = await verifyBookingOwnershipServerSide({
+      bookingReference: parsed.data.bookingReference,
+      lookupToken: parsed.data.lookupToken,
+    });
+    if (!verified.ok) {
+      res.status(verified.statusCode).json({
+        code: verified.code,
+        error: verified.error,
       });
-      if (!bookingRes.ok || !bookingRes.data) {
-        res.status(bookingRes.statusCode).json({
-          code: bookingRes.code,
-          error: bookingRes.error ?? 'Reservation not found.',
-        });
-        return;
-      }
-      row = bookingRes.data;
-    } else {
-      const supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim().replace(/\/+$/, '');
-      const anonKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
-      if (!supabaseUrl || !anonKey) {
-        res.status(503).json({
-          code: 'SUPABASE_NOT_CONFIGURED',
-          error: 'Supabase connection is required to verify this reservation before sending email.',
-        });
-        return;
-      }
-
-      try {
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json',
-          apikey: anonKey,
-        };
-        if (anonKey.startsWith('eyJ')) {
-          headers.Authorization = `Bearer ${anonKey}`;
-        }
-        const edgeRes = await fetch(`${supabaseUrl}/functions/v1/booking-lookup`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            bookingReference: parsed.data.bookingReference,
-            lookupToken: parsed.data.lookupToken,
-          }),
-        });
-        const edgePayload = (await edgeRes.json().catch(() => ({}))) as Record<string, unknown>;
-        if (!edgeRes.ok) {
-          res.status(edgeRes.status).json({
-            code: typeof edgePayload.code === 'string' ? edgePayload.code : 'LOOKUP_FAILED',
-            error:
-              typeof edgePayload.error === 'string'
-                ? edgePayload.error
-                : 'Unable to verify reservation credentials.',
-          });
-          return;
-        }
-        row = edgePayload as unknown as NonNullable<typeof row>;
-      } catch {
-        res.status(502).json({
-          code: 'EDGE_LOOKUP_UNREACHABLE',
-          error: 'Unable to reach Supabase Edge Function to verify reservation for email.',
-        });
-        return;
-      }
-    }
-
-    if (!row) {
-      res.status(404).json({ code: 'NOT_FOUND', error: 'Reservation not found.' });
       return;
     }
 
+    const row = verified.row;
     const reqHost = req.headers.host;
     const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim() || req.protocol || 'https';
     const appBaseUrl = process.env.APP_URL?.trim() || (reqHost ? `${proto}://${reqHost}` : 'https://pickmyball.ph');
@@ -387,7 +450,6 @@ export function createApp(options?: CreateAppOptions) {
       reservationStatus: row.reservation_status,
       paymentStatus: row.payment_status,
       holdExpiresAtIso: row.hold_expires_at,
-      lookupToken: parsed.data.lookupToken,
       appBaseUrl,
     });
 
@@ -448,6 +510,96 @@ export function createApp(options?: CreateAppOptions) {
       return;
     }
     const result = await adminCancelReservation(auth.staff, req.params.reference, parsed.data.reason);
+    if (result.ok) {
+      await revokeQrCheckInTokens({
+        bookingReference: req.params.reference,
+        reason: 'reservation_cancelled',
+        permanent: true,
+        staffUserId: auth.staff.userId,
+        adminClient: auth.staff.adminClient,
+      });
+    }
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
+  // Reception / Staff QR Check-In Verification & Revocation (Strictly Staff Authenticated)
+  app.post('/api/admin/check-in/verify', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+      'reception_staff',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ code: 'UNAUTHORIZED', error: auth.error });
+      return;
+    }
+
+    const schema = z.object({
+      qrPayloadOrToken: z.string().trim().min(10, 'Scanned QR URI or check-in token is required').max(2048),
+      consume: z.boolean().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        code: 'VALIDATION_ERROR',
+        error: parsed.error.issues[0]?.message ?? 'Valid check-in QR payload or token is required.',
+      });
+      return;
+    }
+
+    const result = await verifyAndConsumeQrCheckInToken({
+      qrPayloadOrToken: parsed.data.qrPayloadOrToken,
+      consume: parsed.data.consume,
+      staffUserId: auth.staff.userId,
+      dbClient: auth.staff.dbClient,
+      adminClient: auth.staff.adminClient,
+    });
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
+  app.post('/api/admin/check-in/revoke', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+      'reception_staff',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ code: 'UNAUTHORIZED', error: auth.error });
+      return;
+    }
+
+    const schema = z.object({
+      bookingReference: z.string().trim().regex(/^PMB-[0-9]{8}-[A-Z0-9]{4,8}$/i).optional(),
+      qrPayloadOrToken: z.string().trim().min(10).max(2048).optional(),
+      reason: z.string().trim().min(3, 'Revocation reason is required').max(240),
+      permanent: z.boolean().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        code: 'VALIDATION_ERROR',
+        error: parsed.error.issues[0]?.message ?? 'Provide a booking reference or token and revocation reason.',
+      });
+      return;
+    }
+
+    const allowPermanent = auth.staff.profile.role === 'super_admin' || auth.staff.profile.role === 'manager';
+    if (parsed.data.permanent && !allowPermanent) {
+      res.status(403).json({
+        code: 'FORBIDDEN',
+        error: 'Manager or Super Admin role is required to permanently revoke check-in privileges.',
+      });
+      return;
+    }
+
+    const result = await revokeQrCheckInTokens({
+      bookingReference: parsed.data.bookingReference,
+      qrPayloadOrToken: parsed.data.qrPayloadOrToken,
+      reason: parsed.data.reason,
+      permanent: Boolean(parsed.data.permanent && allowPermanent),
+      staffUserId: auth.staff.userId,
+      adminClient: auth.staff.adminClient,
+    });
     res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
   });
 

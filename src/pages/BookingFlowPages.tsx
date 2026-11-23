@@ -505,7 +505,7 @@ export const LookupPage: React.FC = () => {
           {/* QR Check-In Pass (Gated on verified paid confirmation) */}
           <BookingQrPass
             bookingReference={booking.booking_reference}
-            lookupToken={accessToken.trim()}
+            authorizationLookupToken={booking.qrCheckInEligible ? accessToken.trim() : undefined}
             courtNumber={booking.court_number}
             eligible={booking.qrCheckInEligible}
             note={booking.qrCheckInNote}
@@ -797,7 +797,6 @@ export const ConfirmationPage: React.FC = () => {
         {/* Locked QR Pass Status */}
         <BookingQrPass
           bookingReference={hold.bookingReference}
-          lookupToken={hold.lookupToken}
           courtNumber={hold.courtNumber}
           eligible={false}
           note="Temporary hold awaiting payment verification. QR check-in passes unlock only after verified payment confirmation."

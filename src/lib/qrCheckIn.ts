@@ -1,19 +1,16 @@
 import QRCode from 'qrcode';
 import type { PaymentIntentStatusDb, ReservationStatusDb } from '../types/database';
 
+export const QR_CHECKIN_TOKEN_PREFIX = 'chk_v1.';
+
 export interface QrCheckInPassInput {
-  bookingReference: string;
-  lookupToken: string;
-  courtNumber: number;
+  checkInToken: string;
 }
 
 export interface ParsedQrCheckIn {
-  bookingReference: string | null;
-  lookupToken: string | null;
-  courtNumber: number | null;
+  checkInToken: string | null;
+  rejectedLegacyFormat: boolean;
 }
-
-const BOOKING_REF_REGEX = /PMB-[0-9]{8}-[A-Z0-9]{4,8}/i;
 
 export function isQrCheckInEligible(
   reservationStatus: ReservationStatusDb,
@@ -22,58 +19,72 @@ export function isQrCheckInEligible(
   return reservationStatus === 'confirmed' && paymentStatus === 'paid';
 }
 
+export function isDedicatedCheckInToken(value: string): boolean {
+  const trimmed = value.trim();
+  return (
+    trimmed.startsWith(QR_CHECKIN_TOKEN_PREFIX) &&
+    /^chk_v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(trimmed)
+  );
+}
+
 /**
- * Generates an opaque, PII-free check-in URI for confirmed reservations.
- * Never embeds customer phone, email, or payment card information.
+ * Generates an opaque, PII-free QR check-in URI using ONLY a dedicated
+ * server-generated check-in token (chk_v1.*). Never embeds a booking lookup token.
  */
 export function buildQrCheckInPayload(input: QrCheckInPassInput): string {
-  const ref = input.bookingReference.trim().toUpperCase();
-  const token = input.lookupToken.trim();
-  const qs = new URLSearchParams({
-    ref,
-    token,
-    court: String(input.courtNumber),
-  });
+  const token = input.checkInToken.trim();
+  if (!isDedicatedCheckInToken(token)) {
+    throw new Error(
+      'INVALID_CHECKIN_TOKEN: QR payload requires a dedicated server-issued chk_v1 check-in token.',
+    );
+  }
+  const qs = new URLSearchParams({ t: token });
   return `pmb://astoria-regency/checkin?${qs.toString()}`;
 }
 
 /**
- * Parses either a scanned `pmb://astoria-regency/checkin?...` QR payload,
- * a web lookup URL, or a direct typed `PMB-YYYYMMDD-XXXX` booking reference.
+ * Parses either a scanned `pmb://astoria-regency/checkin?t=chk_v1...` QR URI
+ * or a raw `chk_v1.*` server-issued check-in token. Rejects legacy `?token=` formats.
  */
 export function parseQrCheckInInput(raw: string): ParsedQrCheckIn {
   const trimmed = raw.trim();
   if (!trimmed) {
-    return { bookingReference: null, lookupToken: null, courtNumber: null };
+    return { checkInToken: null, rejectedLegacyFormat: false };
   }
 
   try {
     if (trimmed.startsWith('pmb://') || trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
       const parsed = new URL(trimmed);
-      const refParam = parsed.searchParams.get('ref')?.trim().toUpperCase() ?? null;
-      const tokenParam = parsed.searchParams.get('token')?.trim() ?? null;
-      const courtRaw = parsed.searchParams.get('court');
-      const courtNum = courtRaw && /^\d+$/.test(courtRaw) ? Number(courtRaw) : null;
-      const validRef = refParam && BOOKING_REF_REGEX.test(refParam) ? refParam : null;
-      return {
-        bookingReference: validRef,
-        lookupToken: tokenParam || null,
-        courtNumber: courtNum,
-      };
+      const tParam = parsed.searchParams.get('t')?.trim() ?? null;
+      const legacyTokenParam = parsed.searchParams.get('token')?.trim() ?? null;
+
+      if (legacyTokenParam && !tParam) {
+        return { checkInToken: null, rejectedLegacyFormat: true };
+      }
+
+      if (tParam && isDedicatedCheckInToken(tParam)) {
+        return { checkInToken: tParam, rejectedLegacyFormat: false };
+      }
+      return { checkInToken: null, rejectedLegacyFormat: false };
     }
   } catch {
-    // Fall through to plain reference extraction
+    // Fall through to raw check-in token validation
   }
 
-  const refMatch = trimmed.match(BOOKING_REF_REGEX);
-  return {
-    bookingReference: refMatch ? refMatch[0].toUpperCase() : null,
-    lookupToken: null,
-    courtNumber: null,
-  };
+  if (isDedicatedCheckInToken(trimmed)) {
+    return { checkInToken: trimmed, rejectedLegacyFormat: false };
+  }
+
+  return { checkInToken: null, rejectedLegacyFormat: false };
 }
 
 export async function generateQrPassSvg(payload: string): Promise<string> {
+  const parsed = parseQrCheckInInput(payload);
+  if (!parsed.checkInToken) {
+    throw new Error(
+      'INVALID_QR_CHECKIN_PAYLOAD: Refusing to render QR SVG without a dedicated server-issued check-in token.',
+    );
+  }
   return QRCode.toString(payload, {
     type: 'svg',
     errorCorrectionLevel: 'M',

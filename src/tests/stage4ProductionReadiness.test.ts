@@ -3,10 +3,17 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../../server';
 import { buildConfirmationEmailContent, sendBookingConfirmationEmail } from '../../server/emailService';
 import { calculateServerPricingQuote } from '../../server/pricingEngine';
+import {
+  issueServerQrCheckInToken,
+  resetQrCheckInStoreForTests,
+  revokeQrCheckInTokens,
+  verifyAndConsumeQrCheckInToken,
+  verifySignedCheckInClaims,
+} from '../../server/qrCheckInService';
 import {
   buildHitPayHmacSourceString,
   formatCentavosToHitPayAmount,
@@ -62,6 +69,7 @@ describe('Production SPA Routing Fallback & Cloudflare _redirects', () => {
     '/rates',
     '/lookup',
     '/admin',
+    '/admin/dashboard',
     '/admin/login',
     '/admin/pricing',
     '/admin/operating-hours',
@@ -174,7 +182,11 @@ describe('Staff Role-Based Access Control (Super Admin, Manager, Reception Staff
   });
 });
 
-describe('QR Check-In Pass Eligibility, PII-Free Payload & SVG Rendering', () => {
+describe('QR Check-In Pass Eligibility, Server-Signed Token Isolation & SVG Rendering', () => {
+  beforeEach(() => {
+    resetQrCheckInStoreForTests();
+  });
+
   it('strictly unlocks QR passes only for confirmed + paid bookings', () => {
     expect(isQrCheckInEligible('confirmed', 'paid')).toBe(true);
     expect(isQrCheckInEligible('pending_payment', 'created')).toBe(false);
@@ -182,34 +194,229 @@ describe('QR Check-In Pass Eligibility, PII-Free Payload & SVG Rendering', () =>
     expect(isQrCheckInEligible('cancelled', 'paid')).toBe(false);
     expect(isQrCheckInEligible('expired', 'expired')).toBe(false);
     expect(isQrCheckInEligible('payment_review_required', 'paid')).toBe(false);
+
+    const unpaidIssue = issueServerQrCheckInToken({
+      bookingReference: 'PMB-20261128-AB12',
+      courtNumber: 7,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: '2026-11-28T01:00:00.000Z',
+      reservationStatus: 'pending_payment',
+      paymentStatus: 'created',
+      nowMs: Date.parse('2026-11-28T00:15:00.000Z'),
+    });
+    expect(unpaidIssue.ok).toBe(false);
+    if (!unpaidIssue.ok) {
+      expect(unpaidIssue.statusCode).toBe(403);
+      expect(unpaidIssue.code).toBe('QR_NOT_ELIGIBLE');
+    }
   });
 
-  it('builds PII-free check-in URIs, parses scanned payloads, and generates valid SVG markup', async () => {
-    const uri = buildQrCheckInPayload({
-      bookingReference: 'PMB-20261128-AB12',
-      lookupToken: 'opaque-token-secret-xyz',
-      courtNumber: 7,
-    });
-    expect(uri).toBe(
-      'pmb://astoria-regency/checkin?ref=PMB-20261128-AB12&token=opaque-token-secret-xyz&court=7',
+  it('never embeds lookupToken in generated QR payloads, decoded claims, or SVG markup', async () => {
+    const privateLookupToken = 'PRIVATE_LOOKUP_SECRET_DO_NOT_EMBED_9482a1f7';
+
+    // Client-side payload builder & SVG generator must refuse raw lookup tokens or legacy URIs
+    expect(() => buildQrCheckInPayload({ checkInToken: privateLookupToken })).toThrow(
+      /INVALID_CHECKIN_TOKEN/,
     );
-    expect(uri).not.toContain('@');
+    await expect(
+      generateQrPassSvg(
+        `pmb://astoria-regency/checkin?ref=PMB-20261128-AB12&token=${privateLookupToken}&court=7`,
+      ),
+    ).rejects.toThrow(/INVALID_QR_CHECKIN_PAYLOAD/);
 
-    expect(parseQrCheckInInput(uri)).toEqual({
+    // Server issues a dedicated signed chk_v1 check-in token (with zero reference to lookupToken)
+    const nowMs = Date.parse('2026-11-28T00:15:00.000Z');
+    const issued = issueServerQrCheckInToken({
       bookingReference: 'PMB-20261128-AB12',
-      lookupToken: 'opaque-token-secret-xyz',
       courtNumber: 7,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: '2026-11-28T01:00:00.000Z',
+      reservationStatus: 'confirmed',
+      paymentStatus: 'paid',
+      nowMs,
+    });
+    expect(issued.ok).toBe(true);
+    if (!issued.ok) return;
+
+    const { checkInToken, qrPayload } = issued.data;
+    expect(checkInToken.startsWith('chk_v1.')).toBe(true);
+    expect(qrPayload).toBe(buildQrCheckInPayload({ checkInToken }));
+
+    // Assert lookupToken NEVER appears in checkInToken, qrPayload, decoded claims, or SVG XML
+    expect(checkInToken).not.toContain(privateLookupToken);
+    expect(qrPayload).not.toContain(privateLookupToken);
+    expect(qrPayload).not.toContain('token=');
+    expect(qrPayload).not.toContain('@');
+
+    const claimsPart = checkInToken.split('.')[1];
+    const decodedClaimsRaw = Buffer.from(claimsPart, 'base64url').toString('utf8');
+    expect(decodedClaimsRaw).not.toContain(privateLookupToken);
+    const decodedClaims = JSON.parse(decodedClaimsRaw);
+    expect(decodedClaims).toMatchObject({
+      v: 1,
+      typ: 'pmb_qr_checkin',
+      ref: 'PMB-20261128-AB12',
+      court: 7,
+    });
+    expect(decodedClaims).not.toHaveProperty('lookupToken');
+
+    // Client parser rejects legacy ?token= URIs and extracts dedicated chk_v1 tokens
+    expect(
+      parseQrCheckInInput(
+        `pmb://astoria-regency/checkin?ref=PMB-20261128-AB12&token=${privateLookupToken}`,
+      ),
+    ).toEqual({
+      checkInToken: null,
+      rejectedLegacyFormat: true,
+    });
+    expect(parseQrCheckInInput(qrPayload)).toEqual({
+      checkInToken,
+      rejectedLegacyFormat: false,
     });
 
-    expect(parseQrCheckInInput('pmb-20261128-ab12')).toEqual({
-      bookingReference: 'PMB-20261128-AB12',
-      lookupToken: null,
-      courtNumber: null,
-    });
-
-    const svg = await generateQrPassSvg(uri);
+    const svg = await generateQrPassSvg(qrPayload);
     expect(svg).toContain('<svg');
     expect(svg).toContain('</svg>');
+    expect(svg).not.toContain(privateLookupToken);
+  });
+
+  it('enforces HMAC signatures, expiry, single-use redemption, revocation, and staff auth', async () => {
+    const issuedAt = Date.parse('2026-11-28T00:05:00.000Z');
+    const endAt = '2026-11-28T01:00:00.000Z'; // Grace expires at 02:00:00Z
+    const issued = issueServerQrCheckInToken({
+      bookingReference: 'PMB-20261128-ZX99',
+      courtNumber: 3,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: endAt,
+      reservationStatus: 'confirmed',
+      paymentStatus: 'paid',
+      nowMs: issuedAt,
+    });
+    expect(issued.ok).toBe(true);
+    if (!issued.ok) return;
+
+    // Tampered token signature must be rejected (401)
+    const parts = issued.data.checkInToken.split('.');
+    const forgedSig = `${parts[2].slice(0, -2)}AA`;
+    const tamperedToken = `${parts[0]}.${parts[1]}.${forgedSig}`;
+    const tamperRes = await verifyAndConsumeQrCheckInToken({
+      qrPayloadOrToken: tamperedToken,
+      staffUserId: 'staff-1',
+      nowMs: issuedAt + 1000,
+    });
+    expect(tamperRes.ok).toBe(false);
+    if (!tamperRes.ok) {
+      expect(tamperRes.statusCode).toBe(401);
+      expect(tamperRes.code).toBe('INVALID_CHECKIN_SIGNATURE');
+    }
+
+    // Legacy ?token= QR format must be rejected by server verifier (400)
+    const legacyRes = await verifyAndConsumeQrCheckInToken({
+      qrPayloadOrToken: 'pmb://astoria-regency/checkin?ref=PMB-20261128-ZX99&token=secret123',
+      staffUserId: 'staff-1',
+      nowMs: issuedAt + 1000,
+    });
+    expect(legacyRes.ok).toBe(false);
+    if (!legacyRes.ok) {
+      expect(legacyRes.statusCode).toBe(400);
+      expect(legacyRes.code).toBe('UNSUPPORTED_LEGACY_QR_FORMAT');
+    }
+
+    // Expired token (after slot end + 60m grace window) must be rejected (410)
+    const expiredRes = verifySignedCheckInClaims(
+      issued.data.checkInToken,
+      Date.parse('2026-11-28T02:05:00.000Z'),
+    );
+    expect(expiredRes.ok).toBe(false);
+    if (!expiredRes.ok) {
+      expect(expiredRes.statusCode).toBe(410);
+      expect(expiredRes.code).toBe('CHECKIN_TOKEN_EXPIRED');
+    }
+
+    // Non-consuming verification preview succeeds, followed by single-use check-in redemption
+    const previewRes = await verifyAndConsumeQrCheckInToken({
+      qrPayloadOrToken: issued.data.qrPayload,
+      consume: false,
+      staffUserId: 'staff-1',
+      nowMs: issuedAt + 5000,
+    });
+    expect(previewRes.ok).toBe(true);
+    if (previewRes.ok) {
+      expect(previewRes.data.consumed).toBe(false);
+    }
+
+    const redeemRes = await verifyAndConsumeQrCheckInToken({
+      qrPayloadOrToken: issued.data.qrPayload,
+      consume: true,
+      staffUserId: 'staff-1',
+      nowMs: issuedAt + 10_000,
+    });
+    expect(redeemRes.ok).toBe(true);
+    if (redeemRes.ok) {
+      expect(redeemRes.data.consumed).toBe(true);
+      expect(redeemRes.data.bookingReference).toBe('PMB-20261128-ZX99');
+    }
+
+    // Replay / second scan must be blocked (409)
+    const replayRes = await verifyAndConsumeQrCheckInToken({
+      qrPayloadOrToken: issued.data.qrPayload,
+      consume: true,
+      staffUserId: 'staff-1',
+      nowMs: issuedAt + 15_000,
+    });
+    expect(replayRes.ok).toBe(false);
+    if (!replayRes.ok) {
+      expect(replayRes.statusCode).toBe(409);
+      expect(replayRes.code).toBe('CHECKIN_ALREADY_REDEEMED');
+    }
+
+    // Separate booking token revoked by staff must be blocked (403)
+    const issued2 = issueServerQrCheckInToken({
+      bookingReference: 'PMB-20261128-RV01',
+      courtNumber: 9,
+      startAtIso: '2026-11-28T00:00:00.000Z',
+      endAtIso: endAt,
+      reservationStatus: 'confirmed',
+      paymentStatus: 'paid',
+      nowMs: issuedAt,
+    });
+    expect(issued2.ok).toBe(true);
+    if (!issued2.ok) return;
+
+    const revRes = await revokeQrCheckInTokens({
+      qrPayloadOrToken: issued2.data.qrPayload,
+      reason: 'guest_reported_compromised_screenshot',
+      permanent: true,
+      staffUserId: 'manager-1',
+      nowMs: issuedAt + 2000,
+    });
+    expect(revRes.ok).toBe(true);
+
+    const postRevokeVerify = await verifyAndConsumeQrCheckInToken({
+      qrPayloadOrToken: issued2.data.qrPayload,
+      staffUserId: 'staff-1',
+      nowMs: issuedAt + 3000,
+    });
+    expect(postRevokeVerify.ok).toBe(false);
+    if (!postRevokeVerify.ok) {
+      expect(postRevokeVerify.statusCode).toBe(403);
+      expect(postRevokeVerify.code).toBe('CHECKIN_TOKEN_REVOKED');
+    }
+
+    // Unauthenticated requests to staff check-in endpoints must fail closed (401)
+    const unauthVerify = await fetch(`${prodBaseUrl}/api/admin/check-in/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ qrPayloadOrToken: issued.data.qrPayload }),
+    });
+    expect(unauthVerify.status).toBe(401);
+
+    const unauthRevoke = await fetch(`${prodBaseUrl}/api/admin/check-in/revoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookingReference: 'PMB-20261128-RV01', reason: 'test' }),
+    });
+    expect(unauthRevoke.status).toBe(401);
   });
 });
 

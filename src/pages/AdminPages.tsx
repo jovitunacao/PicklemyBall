@@ -47,10 +47,13 @@ import {
   adminFetchOperatingHours,
   adminFetchPricingConfig,
   adminFetchReservations,
+  adminRevokeQrCheckIn,
   adminUpdatePricingRequest,
   adminUpsertOperatingHourRequest,
+  adminVerifyQrCheckIn,
   CreateGuestHoldResponse,
   formatCentavosPhp,
+  QrCheckInVerifyResponse,
 } from '../services/bookingApi';
 import { sanitizePricingRuleDisplayName } from '../services/facilityConfigApi';
 import type {
@@ -116,6 +119,9 @@ interface AdminAuditLogRow {
 }
 
 function resolveTabFromPath(pathname: string): AdminTab {
+  if (pathname === '/admin/dashboard' || pathname.startsWith('/admin/dashboard/')) {
+    return 'reservations';
+  }
   if (pathname.startsWith('/admin/walk-in')) return 'walk-in';
   if (pathname.startsWith('/admin/check-in')) return 'check-in';
   if (pathname.startsWith('/admin/pricing')) return 'pricing';
@@ -315,13 +321,19 @@ export const AdminDashboardPage: React.FC = () => {
   const [walkInEmail, setWalkInEmail] = useState('');
   const [walkInResult, setWalkInResult] = useState<CreateGuestHoldResponse | null>(null);
 
-  // QR Check-In verifier
+  // Server-signed QR Check-In verifier & revoker
   const [qrScanInput, setQrScanInput] = useState('');
+  const [qrConsumeOnVerify, setQrConsumeOnVerify] = useState(true);
+  const [qrVerifying, setQrVerifying] = useState(false);
   const [qrVerifyResult, setQrVerifyResult] = useState<{
     eligible: boolean;
     message: string;
-    reservation?: AdminReservationItem;
+    details?: QrCheckInVerifyResponse;
   } | null>(null);
+  const [revokeTargetInput, setRevokeTargetInput] = useState('');
+  const [revokeReasonInput, setRevokeReasonInput] = useState('');
+  const [revokePermanent, setRevokePermanent] = useState(false);
+  const [revokingQr, setRevokingQr] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -651,47 +663,83 @@ export const AdminDashboardPage: React.FC = () => {
     e.preventDefault();
     if (!session) return;
     setQrVerifyResult(null);
+    setGlobalError(null);
+    setActionFeedback(null);
+
     const parsed = parseQrCheckInInput(qrScanInput);
-    if (!parsed.bookingReference) {
+    if (parsed.rejectedLegacyFormat) {
       setQrVerifyResult({
         eligible: false,
-        message: 'Could not extract a valid PMB-YYYYMMDD-XXXX booking reference from scanned input.',
+        message:
+          'Legacy ?token= QR format is rejected. Ask the guest to reopen Booking Lookup to render a dedicated server-signed chk_v1 QR pass.',
       });
       return;
     }
 
-    try {
-      const res = await adminFetchReservations(session.accessToken, {});
-      const list = (res.reservations ?? []) as AdminReservationItem[];
-      const match = list.find(
-        (r) => r.booking_reference.toUpperCase() === parsed.bookingReference,
-      );
-      if (!match) {
-        setQrVerifyResult({
-          eligible: false,
-          message: `No facility reservation found matching ${parsed.bookingReference}.`,
-        });
-        return;
-      }
+    if (!parsed.checkInToken) {
+      setQrVerifyResult({
+        eligible: false,
+        message:
+          'Could not extract a valid dedicated check-in token (pmb://astoria-regency/checkin?t=chk_v1... or raw chk_v1 token).',
+      });
+      return;
+    }
 
-      if (match.status === 'confirmed' || match.status === 'completed') {
-        setQrVerifyResult({
-          eligible: true,
-          message: `Verified for check-in on Court ${match.courts?.court_number ?? '?'}.`,
-          reservation: match,
-        });
-      } else {
-        setQrVerifyResult({
-          eligible: false,
-          message: `Check-in blocked: reservation ${match.booking_reference} has status "${match.status}" (verified payment confirmation required).`,
-          reservation: match,
-        });
+    setQrVerifying(true);
+    try {
+      const result = await adminVerifyQrCheckIn(session.accessToken, {
+        qrPayloadOrToken: qrScanInput.trim(),
+        consume: qrConsumeOnVerify,
+      });
+      setQrVerifyResult({
+        eligible: result.valid,
+        message: result.message,
+        details: result,
+      });
+      if (result.consumed) {
+        setActionFeedback(
+          `Checked in ${result.bookingReference} (Court ${result.courtNumber}) and consumed QR pass.`,
+        );
       }
     } catch (err) {
       setQrVerifyResult({
         eligible: false,
-        message: err instanceof Error ? err.message : 'Unable to verify reservation against server.',
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Unable to verify server-signed QR check-in pass.',
       });
+    } finally {
+      setQrVerifying(false);
+    }
+  };
+
+  const handleRevokeQrPass = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!session) return;
+    setGlobalError(null);
+    setActionFeedback(null);
+
+    const target = revokeTargetInput.trim();
+    const isRef = /^PMB-[0-9]{8}-[A-Z0-9]{4,8}$/i.test(target);
+    setRevokingQr(true);
+    try {
+      const res = await adminRevokeQrCheckIn(session.accessToken, {
+        bookingReference: isRef ? target.toUpperCase() : undefined,
+        qrPayloadOrToken: !isRef ? target : undefined,
+        reason: revokeReasonInput.trim(),
+        permanent: revokePermanent,
+      });
+      setRevokeTargetInput('');
+      setRevokeReasonInput('');
+      setRevokePermanent(false);
+      setActionFeedback(
+        `Revoked QR check-in pass${res.tokenJti ? ` (${res.tokenJti.slice(0, 10)}…)` : ''}${res.bookingReference ? ` for ${res.bookingReference}` : ''}.`,
+      );
+    } catch (err) {
+      setGlobalError(err instanceof Error ? err.message : 'Unable to revoke QR check-in pass.');
+    } finally {
+      setRevokingQr(false);
     }
   };
 
@@ -1050,64 +1098,132 @@ export const AdminDashboardPage: React.FC = () => {
 
           {/* TAB: QR CHECK-IN */}
           {activeTab === 'check-in' && (
-            <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
-              <div>
-                <h2 className="font-display text-2xl font-bold text-navy-950">
-                  Reception QR Pass Verification
-                </h2>
-                <p className="text-xs text-slate-600 mt-1">
-                  Paste a scanned <span className="font-mono">pmb://astoria-regency/checkin?...</span>{' '}
-                  QR URI or enter a booking reference (<span className="font-mono">PMB-YYYYMMDD-XXXX</span>).
-                </p>
-              </div>
-              <form onSubmit={handleVerifyQrInput} className="flex flex-col sm:flex-row gap-3">
-                <input
-                  type="text"
-                  required
-                  value={qrScanInput}
-                  onChange={(e) => setQrScanInput(e.target.value)}
-                  placeholder="pmb://astoria-regency/checkin?ref=PMB-... or PMB-20261124-ABCD"
-                  className="flex-1 min-h-[44px] px-3.5 rounded-lg border border-slate-300 font-mono text-xs"
-                />
-                <button
-                  type="submit"
-                  className="min-h-[44px] px-6 rounded-lg bg-navy-950 text-white text-xs font-semibold whitespace-nowrap"
-                >
-                  Verify Check-In
-                </button>
-              </form>
-
-              {qrVerifyResult && (
-                <div
-                  className={`rounded-lg border p-4 text-xs space-y-2 ${
-                    qrVerifyResult.eligible
-                      ? 'border-green-300 bg-green-50 text-green-950'
-                      : 'border-amber-300 bg-amber-50 text-amber-950'
-                  }`}
-                >
-                  <p className="font-bold">{qrVerifyResult.message}</p>
-                  {qrVerifyResult.reservation && (
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-black/10 font-mono tabular-nums">
-                      <div>
-                        <span className="text-slate-500 block">Ref</span>
-                        {qrVerifyResult.reservation.booking_reference}
-                      </div>
-                      <div>
-                        <span className="text-slate-500 block">Court</span>
-                        Court {qrVerifyResult.reservation.courts?.court_number ?? '—'}
-                      </div>
-                      <div>
-                        <span className="text-slate-500 block">Customer</span>
-                        {qrVerifyResult.reservation.customers?.full_name ?? 'Guest'}
-                      </div>
-                      <div>
-                        <span className="text-slate-500 block">Status</span>
-                        {qrVerifyResult.reservation.status}
-                      </div>
-                    </div>
-                  )}
+            <div className="space-y-6">
+              <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+                <div>
+                  <h2 className="font-display text-2xl font-bold text-navy-950">
+                    Reception QR Pass Verification
+                  </h2>
+                  <p className="text-xs text-slate-600 mt-1">
+                    Scan or paste a guest&apos;s server-signed{' '}
+                    <span className="font-mono">pmb://astoria-regency/checkin?t=chk_v1...</span>{' '}
+                    URI (or raw <span className="font-mono">chk_v1.*</span> token). Signatures,
+                    expiry, reservation confirmation, and single-use redemption are enforced on the
+                    server.
+                  </p>
                 </div>
-              )}
+                <form onSubmit={handleVerifyQrInput} className="space-y-3">
+                  <div className="flex flex-col sm:flex-row gap-3">
+                    <input
+                      type="text"
+                      required
+                      value={qrScanInput}
+                      onChange={(e) => setQrScanInput(e.target.value)}
+                      placeholder="pmb://astoria-regency/checkin?t=chk_v1...."
+                      className="flex-1 min-h-[44px] px-3.5 rounded-lg border border-slate-300 font-mono text-xs"
+                    />
+                    <button
+                      type="submit"
+                      disabled={qrVerifying}
+                      className="min-h-[44px] px-6 rounded-lg bg-navy-950 text-white text-xs font-semibold hover:bg-navy-800 disabled:opacity-60 whitespace-nowrap"
+                    >
+                      {qrVerifying
+                        ? 'Verifying...'
+                        : qrConsumeOnVerify
+                          ? 'Verify & Check In'
+                          : 'Inspect Without Redeeming'}
+                    </button>
+                  </div>
+                  <label className="inline-flex items-center gap-2 text-xs text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={qrConsumeOnVerify}
+                      onChange={(e) => setQrConsumeOnVerify(e.target.checked)}
+                    />
+                    <span>Redeem single-use check-in pass immediately on valid verification</span>
+                  </label>
+                </form>
+
+                {qrVerifyResult && (
+                  <div
+                    className={`rounded-lg border p-4 text-xs space-y-2 ${
+                      qrVerifyResult.eligible
+                        ? 'border-green-300 bg-green-50 text-green-950'
+                        : 'border-amber-300 bg-amber-50 text-amber-950'
+                    }`}
+                  >
+                    <p className="font-bold">{qrVerifyResult.message}</p>
+                    {qrVerifyResult.details && (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-black/10 font-mono tabular-nums">
+                        <div>
+                          <span className="text-slate-500 block">Ref</span>
+                          {qrVerifyResult.details.bookingReference}
+                        </div>
+                        <div>
+                          <span className="text-slate-500 block">Court</span>
+                          Court {qrVerifyResult.details.courtNumber}
+                        </div>
+                        <div>
+                          <span className="text-slate-500 block">Customer</span>
+                          {qrVerifyResult.details.customerName ?? 'Verified Player'}
+                        </div>
+                        <div>
+                          <span className="text-slate-500 block">Pass ID</span>
+                          {qrVerifyResult.details.tokenJti.slice(0, 12)}…
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+                <div>
+                  <h3 className="font-display text-xl font-bold text-navy-950">
+                    Revoke Issued QR Pass
+                  </h3>
+                  <p className="text-xs text-slate-600 mt-1">
+                    Invalidate a previously shared QR token (<span className="font-mono">chk_v1.*</span>)
+                    or revoke active passes for a booking reference (<span className="font-mono">PMB-YYYYMMDD-XXXX</span>).
+                  </p>
+                </div>
+                <form onSubmit={handleRevokeQrPass} className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                  <input
+                    type="text"
+                    required
+                    value={revokeTargetInput}
+                    onChange={(e) => setRevokeTargetInput(e.target.value)}
+                    placeholder="PMB-YYYYMMDD-XXXX or pmb://.../checkin?t=chk_v1..."
+                    className="sm:col-span-2 min-h-[42px] px-3 rounded-lg border border-slate-300 font-mono"
+                  />
+                  <input
+                    type="text"
+                    required
+                    minLength={3}
+                    value={revokeReasonInput}
+                    onChange={(e) => setRevokeReasonInput(e.target.value)}
+                    placeholder="Revocation reason"
+                    className="min-h-[42px] px-3 rounded-lg border border-slate-300"
+                  />
+                  {canPerformStaffAction(role, 'cancelConfirmedReservation') && (
+                    <label className="sm:col-span-2 inline-flex items-center gap-2 text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={revokePermanent}
+                        onChange={(e) => setRevokePermanent(e.target.checked)}
+                      />
+                      <span>Permanently block future QR check-in passes for this reservation (Manager / Super Admin)</span>
+                    </label>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={revokingQr}
+                    className="sm:col-start-3 min-h-[42px] px-4 rounded-lg border border-red-300 bg-red-50 text-red-800 font-semibold hover:bg-red-100 disabled:opacity-60"
+                  >
+                    {revokingQr ? 'Revoking...' : 'Revoke QR Pass'}
+                  </button>
+                </form>
+              </div>
             </div>
           )}
 
