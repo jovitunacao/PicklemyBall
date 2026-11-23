@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   DEFAULT_FACILITY_ID,
+  diagnoseServerSupabaseConfig,
   getSupabaseAdminClient,
   type VerifiedStaffContext,
 } from './supabaseAdmin.ts';
@@ -359,9 +360,19 @@ export async function getAvailabilityForInterval(params: {
     };
   }
 
+  const diag = diagnoseServerSupabaseConfig();
   const admin = getSupabaseAdminClient();
   if (!admin) {
-    // Return explicitly labeled Stage 2 simulated preview when Supabase credentials are not configured yet
+    if (diag.state !== 'unconfigured') {
+      return {
+        ok: false,
+        statusCode: 503,
+        code: diag.state === 'invalid_url' ? 'INVALID_CREDENTIALS' : 'INCOMPLETE_CREDENTIALS',
+        error: diag.message,
+      };
+    }
+
+    // Return explicitly labeled Stage 2 simulated preview ONLY when Supabase credentials are completely unconfigured
     const durationHours = Math.round(params.durationMinutes / 60);
     const sim = getAllCourtsIntervalStatus(params.date, params.startTime, durationHours);
     return {
@@ -393,6 +404,20 @@ export async function getAvailabilityForInterval(params: {
   });
 
   if (error) {
+    const errMsg = `${error.code ?? ''} ${error.message ?? ''}`;
+    if (
+      error.code === '42883' ||
+      error.code === '42P01' ||
+      error.code === 'PGRST202' ||
+      /does not exist|could not find the function|schema cache/i.test(errMsg)
+    ) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required database tables or functions are missing. Run migrations 0001–0004.',
+      };
+    }
     return {
       ok: false,
       statusCode: 502,
@@ -441,8 +466,17 @@ export async function getPricingQuoteForCourt(params: {
     };
   }
 
+  const diag = diagnoseServerSupabaseConfig();
   const admin = getSupabaseAdminClient();
   if (!admin) {
+    if (diag.state !== 'unconfigured') {
+      return {
+        ok: false,
+        statusCode: 503,
+        code: diag.state === 'invalid_url' ? 'INVALID_CREDENTIALS' : 'INCOMPLETE_CREDENTIALS',
+        error: diag.message,
+      };
+    }
     const quote = calculateServerPricingQuote({
       courtNumber: params.courtNumber,
       courtId: `court-${String(params.courtNumber).padStart(2, '0')}`,
@@ -525,8 +559,17 @@ export async function getCourtHourlySchedule(params: {
     };
   }
 
+  const diag = diagnoseServerSupabaseConfig();
   const admin = getSupabaseAdminClient();
   if (!admin) {
+    if (diag.state !== 'unconfigured') {
+      return {
+        ok: false,
+        statusCode: 503,
+        code: diag.state === 'invalid_url' ? 'INVALID_CREDENTIALS' : 'INCOMPLETE_CREDENTIALS',
+        error: diag.message,
+      };
+    }
     const simSlots = getSimulatedDayScheduleForCourt(params.courtNumber, params.date);
     return {
       ok: true,
@@ -928,6 +971,11 @@ export async function adminCreateWalkInHold(
   const res = await createGuestHoldAndPendingBooking(input);
   if (res.ok && res.data) {
     const admin = getSupabaseAdminClient();
+    await admin
+      ?.from('reservations')
+      .update({ source: 'walk_in', created_by_staff_id: staff.userId })
+      .eq('id', res.data.reservationId);
+
     await admin?.from('booking_audit_logs').insert({
       facility_id: DEFAULT_FACILITY_ID,
       reservation_id: res.data.reservationId,
@@ -939,4 +987,360 @@ export async function adminCreateWalkInHold(
     });
   }
   return res;
+}
+
+export async function adminCancelReservation(
+  staff: VerifiedStaffContext,
+  bookingReference: string,
+  reason: string,
+): Promise<ServiceResult<{ cancelled: boolean; reservation: unknown }>> {
+  const admin = getSupabaseAdminClient();
+  if (!admin) {
+    return { ok: false, statusCode: 503, code: 'SUPABASE_NOT_CONFIGURED', error: 'Supabase not configured.' };
+  }
+
+  const { data, error } = await admin.rpc('staff_cancel_reservation', {
+    p_staff_id: staff.userId,
+    p_booking_reference: bookingReference,
+    p_reason: reason,
+  });
+
+  if (error) {
+    const msg = error.message || '';
+    if (msg.includes('FORBIDDEN')) {
+      return { ok: false, statusCode: 403, code: 'FORBIDDEN', error: 'Staff role cannot cancel this reservation.' };
+    }
+    if (msg.includes('NOT_FOUND')) {
+      return { ok: false, statusCode: 404, code: 'BOOKING_NOT_FOUND', error: 'Reservation not found.' };
+    }
+    if (msg.includes('INVALID_STATUS_TRANSITION')) {
+      return {
+        ok: false,
+        statusCode: 409,
+        code: 'INVALID_STATUS_TRANSITION',
+        error: 'Reservation is already in a terminal state.',
+      };
+    }
+    return { ok: false, statusCode: 500, code: 'ADMIN_CANCEL_FAILED', error: 'Unable to cancel reservation.' };
+  }
+
+  return { ok: true, statusCode: 200, data: { cancelled: true, reservation: Array.isArray(data) ? data[0] : data } };
+}
+
+export async function adminDeactivateMaintenanceBlock(
+  staff: VerifiedStaffContext,
+  maintenanceId: string,
+): Promise<ServiceResult<{ deactivated: boolean; id: string }>> {
+  const admin = getSupabaseAdminClient();
+  if (!admin) {
+    return { ok: false, statusCode: 503, code: 'SUPABASE_NOT_CONFIGURED', error: 'Supabase not configured.' };
+  }
+
+  const { data, error } = await admin
+    .from('court_maintenance')
+    .update({ is_active: false })
+    .eq('id', maintenanceId)
+    .eq('facility_id', staff.profile.facility_id || DEFAULT_FACILITY_ID)
+    .select('id')
+    .maybeSingle<{ id: string }>();
+
+  if (error || !data) {
+    return { ok: false, statusCode: 404, code: 'MAINTENANCE_NOT_FOUND', error: 'Maintenance block not found.' };
+  }
+
+  await admin.from('booking_audit_logs').insert({
+    facility_id: staff.profile.facility_id || DEFAULT_FACILITY_ID,
+    actor_type: 'staff',
+    actor_id: staff.userId,
+    event_type: 'court_maintenance_deactivated',
+    payload: { maintenanceId },
+  });
+
+  return { ok: true, statusCode: 200, data: { deactivated: true, id: data.id } };
+}
+
+export async function adminGetPricing(
+  staff: VerifiedStaffContext,
+): Promise<ServiceResult<{ currency: 'PHP'; courts: unknown[]; pricingRules: unknown[] }>> {
+  const admin = getSupabaseAdminClient();
+  if (!admin) {
+    return { ok: false, statusCode: 503, code: 'SUPABASE_NOT_CONFIGURED', error: 'Supabase not configured.' };
+  }
+
+  const facilityId = staff.profile.facility_id || DEFAULT_FACILITY_ID;
+  const [{ data: courts, error: courtsErr }, { data: pricingRules, error: rulesErr }] =
+    await Promise.all([
+      admin
+        .from('courts')
+        .select('id, court_number, name, base_hourly_rate_centavos, status')
+        .eq('facility_id', facilityId)
+        .order('court_number', { ascending: true }),
+      admin
+        .from('pricing_rules')
+        .select('*')
+        .eq('facility_id', facilityId)
+        .order('priority', { ascending: false }),
+    ]);
+
+  if (courtsErr || rulesErr) {
+    return { ok: false, statusCode: 500, code: 'PRICING_QUERY_ERROR', error: 'Failed to retrieve pricing.' };
+  }
+  return {
+    ok: true,
+    statusCode: 200,
+    data: { currency: 'PHP', courts: courts ?? [], pricingRules: pricingRules ?? [] },
+  };
+}
+
+export async function adminCreatePricingRule(
+  staff: VerifiedStaffContext,
+  input: {
+    courtNumber?: number | null;
+    name: string;
+    ruleType: 'standard' | 'weekend' | 'peak' | 'promo';
+    dayScope: 'all' | 'weekday' | 'weekend';
+    startTime?: string | null;
+    endTime?: string | null;
+    rateCentavos?: number | null;
+    discountPercent: number;
+    priority: number;
+    isActive: boolean;
+    validFrom?: string | null;
+    validUntil?: string | null;
+  },
+): Promise<ServiceResult<{ pricingRule: unknown }>> {
+  const admin = getSupabaseAdminClient();
+  if (!admin) {
+    return { ok: false, statusCode: 503, code: 'SUPABASE_NOT_CONFIGURED', error: 'Supabase not configured.' };
+  }
+  const facilityId = staff.profile.facility_id || DEFAULT_FACILITY_ID;
+
+  let courtId: string | null = null;
+  if (input.courtNumber) {
+    const { data: court } = await admin
+      .from('courts')
+      .select('id')
+      .eq('facility_id', facilityId)
+      .eq('court_number', input.courtNumber)
+      .maybeSingle<{ id: string }>();
+    if (!court) {
+      return { ok: false, statusCode: 404, code: 'COURT_NOT_FOUND', error: `Court ${input.courtNumber} not found.` };
+    }
+    courtId = court.id;
+  }
+
+  const { data, error } = await admin
+    .from('pricing_rules')
+    .insert({
+      facility_id: facilityId,
+      court_id: courtId,
+      name: input.name,
+      rule_type: input.ruleType,
+      day_scope: input.dayScope,
+      start_time: input.startTime ?? null,
+      end_time: input.endTime ?? null,
+      rate_centavos: input.rateCentavos ?? null,
+      discount_percent: input.discountPercent,
+      priority: input.priority,
+      is_active: input.isActive,
+      valid_from: input.validFrom ?? null,
+      valid_until: input.validUntil ?? null,
+    })
+    .select('*')
+    .single();
+
+  if (error || !data) {
+    return { ok: false, statusCode: 500, code: 'PRICING_INSERT_ERROR', error: 'Unable to create pricing rule.' };
+  }
+
+  await admin.from('booking_audit_logs').insert({
+    facility_id: facilityId,
+    actor_type: 'staff',
+    actor_id: staff.userId,
+    event_type: 'pricing_rule_created',
+    payload: { ruleId: data.id, name: input.name, ruleType: input.ruleType },
+  });
+
+  return { ok: true, statusCode: 201, data: { pricingRule: data } };
+}
+
+export async function adminPatchPricing(
+  staff: VerifiedStaffContext,
+  input:
+    | { target: 'court_base_rate'; courtNumber: number; baseHourlyRateCentavos: number }
+    | {
+        target: 'pricing_rule';
+        ruleId: string;
+        name?: string;
+        rateCentavos?: number | null;
+        discountPercent?: number;
+        priority?: number;
+        isActive?: boolean;
+      },
+): Promise<ServiceResult<unknown>> {
+  const admin = getSupabaseAdminClient();
+  if (!admin) {
+    return { ok: false, statusCode: 503, code: 'SUPABASE_NOT_CONFIGURED', error: 'Supabase not configured.' };
+  }
+  const facilityId = staff.profile.facility_id || DEFAULT_FACILITY_ID;
+
+  if (input.target === 'court_base_rate') {
+    const { data, error } = await admin
+      .from('courts')
+      .update({ base_hourly_rate_centavos: input.baseHourlyRateCentavos })
+      .eq('facility_id', facilityId)
+      .eq('court_number', input.courtNumber)
+      .select('id, court_number, base_hourly_rate_centavos')
+      .maybeSingle();
+
+    if (error || !data) {
+      return { ok: false, statusCode: 404, code: 'COURT_NOT_FOUND', error: 'Court not found.' };
+    }
+
+    await admin.from('booking_audit_logs').insert({
+      facility_id: facilityId,
+      actor_type: 'staff',
+      actor_id: staff.userId,
+      event_type: 'court_base_rate_updated',
+      payload: { courtNumber: input.courtNumber, baseHourlyRateCentavos: input.baseHourlyRateCentavos },
+    });
+
+    return { ok: true, statusCode: 200, data: { court: data } };
+  }
+
+  const updates: Record<string, unknown> = {};
+  if (input.name !== undefined) updates.name = input.name;
+  if (input.rateCentavos !== undefined) updates.rate_centavos = input.rateCentavos;
+  if (input.discountPercent !== undefined) updates.discount_percent = input.discountPercent;
+  if (input.priority !== undefined) updates.priority = input.priority;
+  if (input.isActive !== undefined) updates.is_active = input.isActive;
+
+  const { data, error } = await admin
+    .from('pricing_rules')
+    .update(updates)
+    .eq('facility_id', facilityId)
+    .eq('id', input.ruleId)
+    .select('*')
+    .maybeSingle();
+
+  if (error || !data) {
+    return { ok: false, statusCode: 404, code: 'PRICING_RULE_NOT_FOUND', error: 'Pricing rule not found.' };
+  }
+
+  await admin.from('booking_audit_logs').insert({
+    facility_id: facilityId,
+    actor_type: 'staff',
+    actor_id: staff.userId,
+    event_type: 'pricing_rule_updated',
+    payload: { ruleId: input.ruleId, updates },
+  });
+
+  return { ok: true, statusCode: 200, data: { pricingRule: data } };
+}
+
+export async function adminGetOperatingHours(
+  staff: VerifiedStaffContext,
+): Promise<ServiceResult<{ timezone: 'Asia/Manila'; operatingHours: unknown[]; facilitySettings: unknown }>> {
+  const admin = getSupabaseAdminClient();
+  if (!admin) {
+    return { ok: false, statusCode: 503, code: 'SUPABASE_NOT_CONFIGURED', error: 'Supabase not configured.' };
+  }
+  const facilityId = staff.profile.facility_id || DEFAULT_FACILITY_ID;
+
+  const [{ data: hours, error: hoursErr }, { data: settings }] = await Promise.all([
+    admin
+      .from('operating_hours')
+      .select('*')
+      .eq('facility_id', facilityId)
+      .order('day_of_week', { ascending: true, nullsFirst: false }),
+    admin.from('facility_settings').select('*').eq('facility_id', facilityId).maybeSingle(),
+  ]);
+
+  if (hoursErr) {
+    return { ok: false, statusCode: 500, code: 'HOURS_QUERY_ERROR', error: 'Failed to retrieve operating hours.' };
+  }
+  return {
+    ok: true,
+    statusCode: 200,
+    data: { timezone: 'Asia/Manila', operatingHours: hours ?? [], facilitySettings: settings ?? null },
+  };
+}
+
+export async function adminUpsertOperatingHour(
+  staff: VerifiedStaffContext,
+  input: {
+    dayOfWeek?: number | null;
+    overrideDate?: string | null;
+    openTime: string;
+    closeTime: string;
+    isClosed: boolean;
+    notes?: string | null;
+  },
+): Promise<ServiceResult<{ operatingHour: unknown }>> {
+  const admin = getSupabaseAdminClient();
+  if (!admin) {
+    return { ok: false, statusCode: 503, code: 'SUPABASE_NOT_CONFIGURED', error: 'Supabase not configured.' };
+  }
+  const facilityId = staff.profile.facility_id || DEFAULT_FACILITY_ID;
+
+  const lookup = admin.from('operating_hours').select('id').eq('facility_id', facilityId);
+  const { data: existing } = input.overrideDate
+    ? await lookup.eq('override_date', input.overrideDate).maybeSingle<{ id: string }>()
+    : await lookup.eq('day_of_week', input.dayOfWeek!).maybeSingle<{ id: string }>();
+
+  const values = {
+    facility_id: facilityId,
+    day_of_week: input.overrideDate ? null : input.dayOfWeek!,
+    override_date: input.overrideDate ?? null,
+    open_time: input.openTime,
+    close_time: input.closeTime,
+    is_closed: input.isClosed,
+    notes: input.notes ?? null,
+  };
+
+  const { data, error } = existing
+    ? await admin.from('operating_hours').update(values).eq('id', existing.id).select('*').single()
+    : await admin.from('operating_hours').insert(values).select('*').single();
+
+  if (error || !data) {
+    return { ok: false, statusCode: 500, code: 'HOURS_UPDATE_ERROR', error: 'Unable to update operating hours.' };
+  }
+
+  await admin.from('booking_audit_logs').insert({
+    facility_id: facilityId,
+    actor_type: 'staff',
+    actor_id: staff.userId,
+    event_type: 'operating_hours_updated',
+    payload: values,
+  });
+
+  return { ok: true, statusCode: 200, data: { operatingHour: data } };
+}
+
+export async function adminListAuditLogs(
+  staff: VerifiedStaffContext,
+  filters?: { reservationId?: string; eventType?: string; limit?: number },
+): Promise<ServiceResult<{ auditLogs: unknown[] }>> {
+  const admin = getSupabaseAdminClient();
+  if (!admin) {
+    return { ok: false, statusCode: 503, code: 'SUPABASE_NOT_CONFIGURED', error: 'Supabase not configured.' };
+  }
+  const facilityId = staff.profile.facility_id || DEFAULT_FACILITY_ID;
+  const limit = Math.max(1, Math.min(200, Math.floor(filters?.limit ?? 50)));
+
+  let query = admin
+    .from('booking_audit_logs')
+    .select('id, reservation_id, hold_id, actor_type, actor_id, event_type, payload, created_at')
+    .eq('facility_id', facilityId)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (filters?.reservationId) query = query.eq('reservation_id', filters.reservationId);
+  if (filters?.eventType) query = query.eq('event_type', filters.eventType);
+
+  const { data, error } = await query;
+  if (error) {
+    return { ok: false, statusCode: 500, code: 'AUDIT_QUERY_ERROR', error: 'Failed to retrieve audit logs.' };
+  }
+  return { ok: true, statusCode: 200, data: { auditLogs: data ?? [] } };
 }

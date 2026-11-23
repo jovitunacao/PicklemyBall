@@ -23,3 +23,20 @@ site_url = "http://localhost:3000"
 additional_redirect_urls = ["https://localhost:3000"]
 jwt_expiry = 3600
 enable_signup = true
+
+# Public guest booking Edge Functions accept anon/publishable apikey without user login JWT.
+# Admin Edge Functions (admin-*) retain JWT checks + verifyStaffJwt() staff_profiles RBAC.
+[functions.availability]
+verify_jwt = false
+
+[functions.pricing-quote]
+verify_jwt = false
+
+[functions.guest-holds]
+verify_jwt = false
+
+[functions.booking-lookup]
+verify_jwt = false
+
+[functions.booking-cancel]
+verify_jwt = false

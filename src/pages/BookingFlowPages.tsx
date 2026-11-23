@@ -377,7 +377,7 @@ export const AdminLoginPage: React.FC = () => {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setNotice(
-      'Staff authentication connects via Supabase Auth + staff_profiles RBAC in Stage 6 (API foundation ready in /api/admin/*).',
+      'Staff authentication connects via Supabase Auth + staff_profiles RBAC in Stage 6 (serverless endpoints ready in Supabase Edge Functions: admin-reservations, admin-maintenance, admin-pricing, admin-operating-hours, admin-audit-logs).',
     );
   };
 
@@ -454,9 +454,12 @@ export const AdminDashboardPlaceholderPage: React.FC = () => (
     </p>
     <h1 className="font-display text-4xl font-bold text-navy-950">Administrator Dashboard</h1>
     <p className="text-sm sm:text-base text-slate-600 max-w-2xl leading-relaxed">
-      Backend RBAC endpoints (<code className="font-mono text-xs">/api/admin/*</code>) and
-      PostgreSQL Row Level Security policies are in place from Stages 3–4. The full visual admin
-      UI will launch in Stage 6.
+      Serverless RBAC Edge Functions (
+      <code className="font-mono text-xs">
+        admin-reservations, admin-maintenance, admin-pricing, admin-operating-hours, admin-audit-logs
+      </code>
+      ) and PostgreSQL Row Level Security policies are in place from Stages 3–4. The full visual
+      admin UI will launch in Stage 6.
     </p>
     <Link
       to={SITE_ROUTES.home}

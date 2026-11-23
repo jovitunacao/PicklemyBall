@@ -17,6 +17,8 @@ import {
 } from '../lib/manilaTime';
 import {
   AvailabilityCourtItem,
+  AvailabilityDiagnosticError,
+  AvailabilityDiagnosticKind,
   fetchIntervalAvailability,
   subscribeToAvailabilityRealtime,
 } from '../services/bookingApi';
@@ -39,6 +41,21 @@ function mapApiStatusToEnum(
   }
 }
 
+function getDiagnosticTitle(kind: AvailabilityDiagnosticKind): string {
+  switch (kind) {
+    case 'missing_credentials':
+      return 'Missing Supabase Credentials (Simulated Stage 2 Preview)';
+    case 'invalid_credentials':
+      return 'Invalid or Incomplete Supabase Credentials';
+    case 'undeployed_functions':
+      return 'Supabase Edge Functions Not Deployed';
+    case 'database_schema_error':
+      return 'Database Schema / Migrations Not Applied';
+    case 'network_error':
+      return 'Live Connection / Network Failure';
+  }
+}
+
 export const BookCourtPage: React.FC = () => {
   const initialSchedule = useMemo(() => getInitialManilaSchedule(), []);
   const todayManila = useMemo(() => getManilaTodayDateString(), []);
@@ -57,11 +74,15 @@ export const BookCourtPage: React.FC = () => {
   );
 
   const [availabilitySource, setAvailabilitySource] = useState<
-    'supabase_live' | 'simulated_stage2_fallback'
-  >('simulated_stage2_fallback');
+    'supabase_live' | 'simulated_stage2_fallback' | null
+  >(null);
   const [courtStatuses, setCourtStatuses] = useState<Record<number, SimulatedSlotOutcome>>({});
   const [loadingAvailability, setLoadingAvailability] = useState(true);
-  const [availabilityError, setAvailabilityError] = useState<string | null>(null);
+  const [availabilityDiagnostic, setAvailabilityDiagnostic] = useState<{
+    kind: AvailabilityDiagnosticKind;
+    message: string;
+  } | null>(null);
+  const [scheduleNotice, setScheduleNotice] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
 
   const triggerRefresh = useCallback(() => {
@@ -72,7 +93,7 @@ export const BookCourtPage: React.FC = () => {
   useEffect(() => {
     const controller = new AbortController();
     setLoadingAvailability(true);
-    setAvailabilityError(null);
+    setAvailabilityDiagnostic(null);
 
     fetchIntervalAvailability(
       {
@@ -84,6 +105,16 @@ export const BookCourtPage: React.FC = () => {
     )
       .then((res) => {
         setAvailabilitySource(res.source);
+        if (res.source === 'simulated_stage2_fallback') {
+          setAvailabilityDiagnostic({
+            kind: 'missing_credentials',
+            message:
+              'VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY are not configured yet. Showing Stage 2 simulated availability only; live guest holds require Supabase.',
+          });
+        } else {
+          setAvailabilityDiagnostic(null);
+        }
+
         const map: Record<number, SimulatedSlotOutcome> = {};
         for (const item of res.courts) {
           map[item.courtNumber] = {
@@ -104,9 +135,20 @@ export const BookCourtPage: React.FC = () => {
       })
       .catch((err) => {
         if (err instanceof DOMException && err.name === 'AbortError') return;
-        setAvailabilityError(
-          err instanceof Error ? err.message : 'Unable to check court availability.',
-        );
+        // Never silently fall back to simulated availability when a configured connection fails
+        setAvailabilitySource(null);
+        setCourtStatuses({});
+        setSelectedCourtNumber(null);
+        setInspectedConflictCourtNumber(null);
+
+        if (err instanceof AvailabilityDiagnosticError) {
+          setAvailabilityDiagnostic({ kind: err.kind, message: err.message });
+        } else {
+          setAvailabilityDiagnostic({
+            kind: 'network_error',
+            message: err instanceof Error ? err.message : 'Unable to check court availability.',
+          });
+        }
       })
       .finally(() => {
         if (!controller.signal.aborted) {
@@ -141,13 +183,14 @@ export const BookCourtPage: React.FC = () => {
   const handleDateChange = (nextDate: string) => {
     if (!nextDate) return;
     if (isPastManilaDate(nextDate)) {
-      setAvailabilityError('Past dates are not bookable in Asia/Manila time.');
+      setScheduleNotice('Past dates are not bookable in Asia/Manila time.');
       return;
     }
     if (nextDate > maxDateManila) {
-      setAvailabilityError(`Bookings are limited to ${MAX_ADVANCE_DAYS} days in advance.`);
+      setScheduleNotice(`Bookings are limited to ${MAX_ADVANCE_DAYS} days in advance.`);
       return;
     }
+    setScheduleNotice(null);
     setSelectedDate(nextDate);
     // If switching to today and selected startTime has passed, bump to next open slot
     if (nextDate === todayManila && isPastManilaSlot(nextDate, startTime)) {
@@ -158,15 +201,17 @@ export const BookCourtPage: React.FC = () => {
 
   const handleStartTimeChange = (nextStart: string) => {
     if (isPastManilaSlot(selectedDate, nextStart)) {
-      setAvailabilityError('Cannot select a start time that has already passed.');
+      setScheduleNotice('Cannot select a start time that has already passed.');
       return;
     }
+    setScheduleNotice(null);
     setStartTime(nextStart);
   };
 
   const handleSelectCourt = (courtNumber: number) => {
     const outcome = courtStatuses[courtNumber];
-    if (outcome?.status === CourtStatus.AVAILABLE) {
+    if (!outcome) return;
+    if (outcome.status === CourtStatus.AVAILABLE) {
       setSelectedCourtNumber(courtNumber);
       setInspectedConflictCourtNumber(null);
     } else {
@@ -276,31 +321,48 @@ export const BookCourtPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Availability Source Banner or Error Alert */}
-      {availabilityError ? (
-        <div className="rounded-xl border border-red-300 bg-red-50 px-4 py-3 flex items-center justify-between gap-3 text-xs text-red-950">
-          <div className="flex items-start gap-2.5">
-            <AlertCircle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
-            <span>{availabilityError}</span>
-          </div>
+      {/* Schedule Input Validation Notice */}
+      {scheduleNotice && (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-2.5 flex items-center justify-between gap-3 text-xs text-amber-950">
+          <span>{scheduleNotice}</span>
           <button
             type="button"
-            onClick={triggerRefresh}
-            className="min-h-[36px] px-3 rounded-md bg-red-700 text-white font-semibold hover:bg-red-800 shrink-0"
+            onClick={() => setScheduleNotice(null)}
+            className="font-semibold underline shrink-0"
           >
-            Retry
+            Dismiss
           </button>
         </div>
-      ) : availabilitySource === 'simulated_stage2_fallback' ? (
-        <div className="rounded-xl border border-amber-300 bg-amber-50/80 px-4 py-3 flex items-start gap-3 text-xs text-amber-950">
-          <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-          <p>
-            <span className="font-bold">Supabase Not Connected (Simulated Availability Preview):</span>{' '}
-            The architectural floor plan is displaying Stage 2 simulated availability until your
-            Supabase project credentials and Stage 3 migrations are configured. Live guest holds
-            require the Supabase database connection.
-          </p>
-        </div>
+      )}
+
+      {/* Availability Source Banner or Categorized Diagnostic Alert */}
+      {availabilityDiagnostic ? (
+        availabilityDiagnostic.kind === 'missing_credentials' ? (
+          <div className="rounded-xl border border-amber-300 bg-amber-50/80 px-4 py-3 flex items-start gap-3 text-xs text-amber-950">
+            <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+            <p>
+              <span className="font-bold">{getDiagnosticTitle('missing_credentials')}:</span>{' '}
+              {availabilityDiagnostic.message}
+            </p>
+          </div>
+        ) : (
+          <div className="rounded-xl border border-red-300 bg-red-50 px-4 py-3 flex items-center justify-between gap-3 text-xs text-red-950">
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+              <div className="space-y-0.5">
+                <p className="font-bold">{getDiagnosticTitle(availabilityDiagnostic.kind)}</p>
+                <p>{availabilityDiagnostic.message}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={triggerRefresh}
+              className="min-h-[36px] px-3 rounded-md bg-red-700 text-white font-semibold hover:bg-red-800 shrink-0"
+            >
+              Retry
+            </button>
+          </div>
+        )
       ) : null}
 
       {/* Main Split Workspace */}

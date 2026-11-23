@@ -16,6 +16,10 @@ const seedSql = fs.readFileSync(
   path.join(MIGRATION_DIR, '202611230003_seed_astoria_regency.sql'),
   'utf8',
 );
+const edgeRemediationSql = fs.readFileSync(
+  path.join(MIGRATION_DIR, '202611230004_serverless_rate_limits_and_admin_rpcs.sql'),
+  'utf8',
+);
 
 describe('Stage 3 SQL Migrations Static Integrity & Security Audit', () => {
   const requiredTables = [
@@ -39,6 +43,8 @@ describe('Stage 3 SQL Migrations Static Integrity & Security Audit', () => {
       expect(schemaSql).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
       expect(rlsSql).toContain(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
     }
+    expect(edgeRemediationSql).toContain('CREATE TABLE IF NOT EXISTS api_rate_limits');
+    expect(edgeRemediationSql).toContain('ALTER TABLE api_rate_limits ENABLE ROW LEVEL SECURITY');
   });
 
   it('enforces GiST exclusion constraint with half-open [start_at, end_at) intervals and avoids NOW() in partial index predicates', () => {
@@ -53,8 +59,10 @@ describe('Stage 3 SQL Migrations Static Integrity & Security Audit', () => {
     }
   });
 
-  it('pins search_path and revokes PUBLIC execution on every SECURITY DEFINER function', () => {
-    const definerMatches = [...rlsSql.matchAll(/CREATE OR REPLACE FUNCTION\s+([a-zA-Z0-9_]+)\s*\(/g)];
+  it('pins search_path and revokes PUBLIC execution on every SECURITY DEFINER function across 0002 and 0004', () => {
+    const definerMatches = [
+      ...rlsSql.matchAll(/CREATE OR REPLACE FUNCTION\s+([a-zA-Z0-9_]+)\s*\(/g),
+    ];
     expect(definerMatches.length).toBeGreaterThanOrEqual(7);
 
     for (const m of definerMatches) {
@@ -63,12 +71,32 @@ describe('Stage 3 SQL Migrations Static Integrity & Security Audit', () => {
     }
     const setSearchPaths = rlsSql.match(/SET search_path = public, pg_temp/g) ?? [];
     expect(setSearchPaths.length).toBeGreaterThanOrEqual(definerMatches.length);
+
+    const mig4Defs = [
+      ...edgeRemediationSql.matchAll(/CREATE OR REPLACE FUNCTION\s+([a-zA-Z0-9_]+)\s*\(/g),
+    ];
+    expect(mig4Defs.map((m) => m[1])).toEqual([
+      'check_and_consume_rate_limit',
+      'staff_cancel_reservation',
+      'staff_create_walkin_hold',
+    ]);
+    for (const m of mig4Defs) {
+      expect(edgeRemediationSql).toContain(`REVOKE ALL ON FUNCTION ${m[1]}`);
+      expect(edgeRemediationSql).toContain(`GRANT EXECUTE ON FUNCTION ${m[1]}`);
+    }
+    const mig4SearchPaths = edgeRemediationSql.match(/SET search_path = public, pg_temp/g) ?? [];
+    expect(mig4SearchPaths).toHaveLength(3);
   });
 
-  it('enforces payment evidence guard inside reservation integrity trigger', () => {
+  it('enforces payment evidence guard inside reservation integrity trigger and staff cancel role restriction', () => {
     expect(schemaSql).toContain('enforce_reservation_integrity');
     expect(schemaSql).toContain('pmb.allow_verified_confirmation');
     expect(schemaSql).toContain('Reservation cannot be confirmed without verified payment evidence');
+
+    expect(edgeRemediationSql).toContain(
+      "IF v_res.status = 'confirmed' AND v_staff.role = 'reception_staff' THEN",
+    );
+    expect(edgeRemediationSql).toContain('acquire_court_hold_and_pending_booking');
   });
 
   it('seeds all 14 courts (1-14) with 941x1600 architectural polygons and Asia/Manila + PHP defaults', () => {

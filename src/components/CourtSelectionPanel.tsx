@@ -28,7 +28,7 @@ import { CourtStatus } from '../types/booking';
 interface CourtSelectionPanelProps {
   courtNumber: number | null;
   courtOutcome: SimulatedSlotOutcome | null;
-  availabilitySource: 'supabase_live' | 'simulated_stage2_fallback';
+  availabilitySource: 'supabase_live' | 'simulated_stage2_fallback' | null;
   selectedDate: string;
   startTime: string;
   durationHours: number;
@@ -156,7 +156,9 @@ export const CourtSelectionPanel: React.FC<CourtSelectionPanelProps> = ({
             Source:{' '}
             {availabilitySource === 'supabase_live'
               ? 'Live Supabase Availability'
-              : 'Simulated Stage 2 Fallback (Configure Supabase for live holds)'}
+              : availabilitySource === 'simulated_stage2_fallback'
+                ? 'Simulated Stage 2 Fallback (Missing Credentials)'
+                : 'Live Connection Diagnostic Required'}
           </p>
         </div>
       </div>

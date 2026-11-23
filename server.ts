@@ -4,9 +4,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import {
+  adminCancelReservation,
   adminCreateMaintenanceBlock,
+  adminCreatePricingRule,
   adminCreateWalkInHold,
+  adminDeactivateMaintenanceBlock,
+  adminGetOperatingHours,
+  adminGetPricing,
+  adminListAuditLogs,
   adminListReservations,
+  adminPatchPricing,
+  adminUpsertOperatingHour,
   AvailabilityQuerySchema,
   CancelBookingSchema,
   cancelBookingSecurely,
@@ -19,8 +27,23 @@ import {
   lookupBookingSecurely,
 } from './server/bookingService.ts';
 import { SlidingWindowRateLimiter } from './server/bookingUtils.ts';
-import { isSupabaseServerConfigured, verifyStaffAuthorization } from './server/supabaseAdmin.ts';
+import {
+  diagnoseServerSupabaseConfig,
+  getSupabaseAdminClient,
+  isSupabaseServerConfigured,
+  verifyStaffAuthorization,
+} from './server/supabaseAdmin.ts';
 import { isValidDateString } from './src/lib/manilaTime.ts';
+import {
+  isOriginAllowed,
+  parseAllowedOrigins,
+} from './supabase/functions/_shared/cors.ts';
+import {
+  AdminCreateMaintenanceSchema,
+  AdminCreatePricingRuleSchema,
+  AdminPatchPricingSchema,
+  AdminUpsertOperatingHourSchema,
+} from './supabase/functions/_shared/validation.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -30,8 +53,34 @@ const rateLimiter = new SlidingWindowRateLimiter(
   Number(process.env.RATE_LIMIT_MAX_REQUESTS || 40),
 );
 
-function publicRateLimit(req: Request, res: Response, next: NextFunction) {
+async function publicRateLimit(req: Request, res: Response, next: NextFunction) {
   const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  const admin = getSupabaseAdminClient();
+  const windowSeconds = Math.max(1, Math.round(Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000) / 1000));
+  const maxRequests = Number(process.env.RATE_LIMIT_MAX_REQUESTS || 40);
+
+  if (admin) {
+    const { data, error } = await admin.rpc('check_and_consume_rate_limit', {
+      p_bucket_key: `${req.path}:${clientIp}`,
+      p_window_seconds: windowSeconds,
+      p_max_requests: maxRequests,
+    });
+    if (!error && data) {
+      const row = Array.isArray(data) ? data[0] : data;
+      res.setHeader('X-RateLimit-Remaining', String(row.remaining ?? 0));
+      if (!row.allowed) {
+        res.setHeader('Retry-After', String(row.retry_after_seconds ?? 1));
+        res.status(429).json({
+          code: 'RATE_LIMIT_EXCEEDED',
+          error: 'Too many requests. Please wait briefly before retrying.',
+        });
+        return;
+      }
+      next();
+      return;
+    }
+  }
+
   const result = rateLimiter.consume(`${clientIp}:${req.path}`);
   res.setHeader('X-RateLimit-Remaining', String(result.remaining));
   if (!result.allowed) {
@@ -50,13 +99,47 @@ export function createApp() {
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '64kb' }));
 
+  app.use('/api', (req, res, next) => {
+    const originHeader = req.headers.origin;
+    const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
+    res.setHeader('Vary', 'Origin');
+
+    if (originHeader && !isOriginAllowed(originHeader, allowedOrigins)) {
+      res.status(403).json({
+        code: 'CORS_ORIGIN_FORBIDDEN',
+        error: 'Origin is not in the configured ALLOWED_ORIGINS allowlist.',
+      });
+      return;
+    }
+
+    if (originHeader) {
+      res.setHeader('Access-Control-Allow-Origin', originHeader.trim().replace(/\/+$/, ''));
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'authorization, x-client-info, apikey, content-type');
+    }
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
   app.get('/api/health', (_req, res) => {
+    const diag = diagnoseServerSupabaseConfig();
     res.json({
       status: 'ok',
       stage: 'stage-4',
       timezone: 'Asia/Manila',
       currency: 'PHP',
       supabaseConfigured: isSupabaseServerConfigured(),
+      supabaseConfigState: diag.state,
+      envPresence: {
+        SUPABASE_URL: diag.hasUrl,
+        SUPABASE_ANON_KEY: diag.hasAnonKey,
+        SUPABASE_SERVICE_ROLE_KEY: diag.hasServiceRoleKey,
+      },
       paymentGatewayEnabled: false,
     });
   });
@@ -213,6 +296,28 @@ export function createApp() {
     res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
   });
 
+  app.post('/api/admin/reservations/:reference/cancel', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+      'reception_staff',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ error: auth.error });
+      return;
+    }
+    const schema = z.object({
+      reason: z.string().trim().min(3).max(240),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Cancellation reason is required.' });
+      return;
+    }
+    const result = await adminCancelReservation(auth.staff, req.params.reference, parsed.data.reason);
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
   app.post('/api/admin/maintenance', async (req, res) => {
     const auth = await verifyStaffAuthorization(req.headers.authorization, [
       'super_admin',
@@ -222,18 +327,127 @@ export function createApp() {
       res.status(auth.statusCode).json({ error: auth.error });
       return;
     }
-    const schema = z.object({
-      courtNumber: z.coerce.number().int().min(1).max(14),
-      startAtIso: z.string().datetime(),
-      endAtIso: z.string().datetime(),
-      reason: z.string().trim().min(3).max(200),
-    });
-    const parsed = schema.safeParse(req.body);
+    const parsed = AdminCreateMaintenanceSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid maintenance request.' });
       return;
     }
     const result = await adminCreateMaintenanceBlock(auth.staff, parsed.data);
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
+  app.delete('/api/admin/maintenance/:id', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ error: auth.error });
+      return;
+    }
+    const idCheck = z.string().uuid().safeParse(req.params.id);
+    if (!idCheck.success) {
+      res.status(400).json({ error: 'Valid maintenance block UUID is required.' });
+      return;
+    }
+    const result = await adminDeactivateMaintenanceBlock(auth.staff, idCheck.data);
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
+  app.get('/api/admin/pricing', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ error: auth.error });
+      return;
+    }
+    const result = await adminGetPricing(auth.staff);
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
+  app.post('/api/admin/pricing', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ error: auth.error });
+      return;
+    }
+    const parsed = AdminCreatePricingRuleSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid pricing rule payload.' });
+      return;
+    }
+    const result = await adminCreatePricingRule(auth.staff, parsed.data);
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
+  app.patch('/api/admin/pricing', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ error: auth.error });
+      return;
+    }
+    const parsed = AdminPatchPricingSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid pricing update payload.' });
+      return;
+    }
+    const result = await adminPatchPricing(auth.staff, parsed.data);
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
+  app.get('/api/admin/operating-hours', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ error: auth.error });
+      return;
+    }
+    const result = await adminGetOperatingHours(auth.staff);
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
+  app.put('/api/admin/operating-hours', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ error: auth.error });
+      return;
+    }
+    const parsed = AdminUpsertOperatingHourSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid operating hours payload.' });
+      return;
+    }
+    const result = await adminUpsertOperatingHour(auth.staff, parsed.data);
+    res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
+  });
+
+  app.get('/api/admin/audit-logs', async (req, res) => {
+    const auth = await verifyStaffAuthorization(req.headers.authorization, [
+      'super_admin',
+      'manager',
+    ]);
+    if (!auth.ok) {
+      res.status(auth.statusCode).json({ error: auth.error });
+      return;
+    }
+    const result = await adminListAuditLogs(auth.staff, {
+      reservationId: typeof req.query.reservationId === 'string' ? req.query.reservationId : undefined,
+      eventType: typeof req.query.eventType === 'string' ? req.query.eventType : undefined,
+      limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
+    });
     res.status(result.statusCode).json(result.ok ? result.data : { code: result.code, error: result.error });
   });
 
