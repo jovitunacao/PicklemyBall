@@ -917,6 +917,54 @@ export async function createGuestHoldAndPendingBooking(
 
   if (error) {
     const msg = error.message || '';
+    if (classifyDbSchemaError(error) || msg.includes('OPERATING_HOURS_NOT_CONFIGURED')) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required Pick My Ball database tables or seed schedules are missing. Run migrations 0001–0004.',
+      };
+    }
+    if (msg.includes('FACILITY_CLOSED')) {
+      return {
+        ok: false,
+        statusCode: 400,
+        code: 'FACILITY_CLOSED',
+        error: `The facility is closed on ${input.date}.`,
+      };
+    }
+    if (msg.includes('OUTSIDE_OPERATING_HOURS')) {
+      return {
+        ok: false,
+        statusCode: 400,
+        code: 'OUTSIDE_OPERATING_HOURS',
+        error: 'Requested interval falls outside Astoria Regency operating hours.',
+      };
+    }
+    if (msg.includes('ADVANCE_LIMIT_EXCEEDED')) {
+      return {
+        ok: false,
+        statusCode: 400,
+        code: 'ADVANCE_LIMIT_EXCEEDED',
+        error: 'Requested date exceeds the maximum advance booking window.',
+      };
+    }
+    if (msg.includes('INVALID_DURATION')) {
+      return {
+        ok: false,
+        statusCode: 400,
+        code: 'INVALID_DURATION',
+        error: 'Requested booking duration falls outside facility limits.',
+      };
+    }
+    if (msg.includes('PAST_BOOKING_REJECTED')) {
+      return {
+        ok: false,
+        statusCode: 400,
+        code: 'PAST_TIME_REJECTED',
+        error: 'Selected start time has already passed in Asia/Manila time.',
+      };
+    }
     if (msg.includes('BOOKING_CONFLICT') || msg.includes('HOLD_CONFLICT') || msg.includes('excl_reservations_no_overlap')) {
       return {
         ok: false,
@@ -1050,6 +1098,24 @@ export async function cancelBookingSecurely(
   });
 
   if (error) {
+    const msg = error.message || '';
+    if (classifyDbSchemaError(error)) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required Pick My Ball database tables or functions are missing. Run migrations 0001–0004.',
+      };
+    }
+    if (msg.includes('CUSTOMER_CANCELLATION_FORBIDDEN')) {
+      return {
+        ok: false,
+        statusCode: 403,
+        code: 'CUSTOMER_CANCELLATION_FORBIDDEN',
+        error:
+          'Confirmed or paid reservations cannot be cancelled online. Please contact Pick My Ball reception staff.',
+      };
+    }
     return {
       ok: false,
       statusCode: 500,

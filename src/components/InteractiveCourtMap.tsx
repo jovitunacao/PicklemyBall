@@ -209,7 +209,10 @@ export const InteractiveCourtMap: React.FC<InteractiveCourtMapProps> = ({
     if (selectedCourtNumber === courtNumber) {
       return CourtStatus.SELECTED;
     }
-    return courtStatuses[courtNumber]?.status ?? CourtStatus.AVAILABLE;
+    if (!courtStatuses[courtNumber]) {
+      return CourtStatus.MAINTENANCE;
+    }
+    return courtStatuses[courtNumber].status;
   };
 
   const handlePolygonClick = (courtNumber: number) => {
@@ -444,7 +447,7 @@ export const InteractiveCourtMap: React.FC<InteractiveCourtMapProps> = ({
                           fontWeight="700"
                           fontFamily="JetBrains Mono, monospace"
                         >
-                          {style.shortTag}
+                          {outcome ? style.shortTag : 'UNVERIFIED'}
                         </text>
                       </g>
                     </g>
@@ -490,7 +493,9 @@ export const InteractiveCourtMap: React.FC<InteractiveCourtMapProps> = ({
                         </div>
                         <div className="text-xs text-slate-500 mt-0.5">
                           {court.orientation === 'landscape' ? 'Horizontal' : 'Vertical'} ·{' '}
-                          {outcome?.reason.replace(' (simulated).', '')}
+                          {outcome
+                            ? outcome.reason.replace(' (simulated).', '')
+                            : 'Availability unavailable — live check required'}
                         </div>
                       </div>
                       <span
@@ -502,7 +507,7 @@ export const InteractiveCourtMap: React.FC<InteractiveCourtMapProps> = ({
                           aria-hidden="true"
                           className={`w-3 h-3 rounded-xs border ${legend?.swatchClass ?? ''}`}
                         />
-                        <span>{legend?.label ?? status}</span>
+                        <span>{outcome ? (legend?.label ?? status) : 'Unverified'}</span>
                       </span>
                     </button>
                   );

@@ -197,6 +197,54 @@ Deno.serve(async (req: Request) => {
 
     if (error) {
       const msg = error.message || '';
+      if (classifyDbSchemaError(error) || msg.includes('OPERATING_HOURS_NOT_CONFIGURED')) {
+        return errorResponse(
+          500,
+          'DATABASE_SCHEMA_ERROR',
+          'Required Pick My Ball database tables or seed schedules are missing. Run migrations 0001–0004.',
+          headersWithRate,
+        );
+      }
+      if (msg.includes('FACILITY_CLOSED')) {
+        return errorResponse(
+          400,
+          'FACILITY_CLOSED',
+          `The facility is closed on ${input.date}.`,
+          headersWithRate,
+        );
+      }
+      if (msg.includes('OUTSIDE_OPERATING_HOURS')) {
+        return errorResponse(
+          400,
+          'OUTSIDE_OPERATING_HOURS',
+          'Requested interval falls outside Astoria Regency operating hours.',
+          headersWithRate,
+        );
+      }
+      if (msg.includes('ADVANCE_LIMIT_EXCEEDED')) {
+        return errorResponse(
+          400,
+          'ADVANCE_LIMIT_EXCEEDED',
+          'Requested date exceeds the maximum advance booking window.',
+          headersWithRate,
+        );
+      }
+      if (msg.includes('INVALID_DURATION')) {
+        return errorResponse(
+          400,
+          'INVALID_DURATION',
+          'Requested booking duration falls outside facility limits.',
+          headersWithRate,
+        );
+      }
+      if (msg.includes('PAST_BOOKING_REJECTED')) {
+        return errorResponse(
+          400,
+          'PAST_TIME_REJECTED',
+          'Selected start time has already passed in Asia/Manila time.',
+          headersWithRate,
+        );
+      }
       if (
         msg.includes('BOOKING_CONFLICT') ||
         msg.includes('HOLD_CONFLICT') ||

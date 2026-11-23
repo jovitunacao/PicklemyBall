@@ -75,6 +75,15 @@ Deno.serve(async (req: Request) => {
           headersWithRate,
         );
       }
+      const msg = error.message || '';
+      if (msg.includes('CUSTOMER_CANCELLATION_FORBIDDEN')) {
+        return errorResponse(
+          403,
+          'CUSTOMER_CANCELLATION_FORBIDDEN',
+          'Confirmed or paid reservations cannot be cancelled online. Please contact Pick My Ball reception staff.',
+          headersWithRate,
+        );
+      }
       return errorResponse(
         500,
         'CANCEL_FAILED',

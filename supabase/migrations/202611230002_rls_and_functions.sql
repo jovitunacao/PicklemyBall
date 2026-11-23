@@ -241,6 +241,12 @@ BEGIN
     RAISE EXCEPTION 'End time must be after start time';
   END IF;
 
+  IF NOT EXISTS (
+    SELECT 1 FROM facilities f WHERE f.id = p_facility_id AND f.is_active = true
+  ) THEN
+    RAISE EXCEPTION 'FACILITY_NOT_FOUND: Facility % does not exist or is inactive', p_facility_id;
+  END IF;
+
   v_range := tstzrange(p_start_at, p_end_at, '[)');
 
   RETURN QUERY
@@ -334,6 +340,8 @@ GRANT EXECUTE ON FUNCTION get_public_court_availability(UUID, TIMESTAMPTZ, TIMES
 
 -- ---------------------------------------------------------------------------
 -- Expire Stale Holds Safely (called by cron or opportunistically in RPC)
+-- Uses deterministic row locking for scoped court cleanups and SKIP LOCKED
+-- for global opportunistic sweeps so read queries never deadlock active writes.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION cleanup_expired_holds(p_court_id UUID DEFAULT NULL)
 RETURNS INTEGER
@@ -344,23 +352,87 @@ AS $$
 DECLARE
   v_expired_count INTEGER := 0;
 BEGIN
-  WITH expired_holds AS (
-    UPDATE reservation_holds rh
-    SET status = 'expired'
-    WHERE rh.status = 'active'
-      AND rh.expires_at <= now()
-      AND (p_court_id IS NULL OR rh.court_id = p_court_id)
-    RETURNING rh.id
-  ),
-  expired_reservations AS (
-    UPDATE reservations r
-    SET status = 'expired'
-    FROM expired_holds eh
-    WHERE r.hold_id = eh.id
-      AND r.status = 'pending_payment'
-    RETURNING r.id
-  )
-  SELECT count(*) INTO v_expired_count FROM expired_holds;
+  IF p_court_id IS NOT NULL THEN
+    WITH locked_holds AS (
+      SELECT rh.id
+      FROM reservation_holds rh
+      WHERE rh.status = 'active'
+        AND rh.expires_at <= now()
+        AND rh.court_id = p_court_id
+      ORDER BY rh.id
+      FOR UPDATE
+    ),
+    expired_holds AS (
+      UPDATE reservation_holds rh
+      SET status = 'expired'
+      FROM locked_holds lh
+      WHERE rh.id = lh.id
+      RETURNING rh.id
+    ),
+    expired_reservations AS (
+      UPDATE reservations r
+      SET status = 'expired'
+      WHERE r.status = 'pending_payment'
+        AND r.court_id = p_court_id
+        AND (
+          r.hold_id IN (SELECT id FROM expired_holds)
+          OR EXISTS (
+            SELECT 1 FROM reservation_holds rh2
+            WHERE rh2.id = r.hold_id
+              AND rh2.status = 'expired'
+          )
+        )
+      RETURNING r.id
+    ),
+    expired_intents AS (
+      UPDATE payment_intents pi
+      SET status = 'expired'
+      FROM expired_reservations er
+      WHERE pi.reservation_id = er.id
+        AND pi.status IN ('created', 'pending')
+      RETURNING pi.id
+    )
+    SELECT count(*) INTO v_expired_count FROM expired_holds;
+  ELSE
+    WITH locked_holds AS (
+      SELECT rh.id
+      FROM reservation_holds rh
+      WHERE rh.status = 'active'
+        AND rh.expires_at <= now()
+      ORDER BY rh.id
+      FOR UPDATE SKIP LOCKED
+    ),
+    expired_holds AS (
+      UPDATE reservation_holds rh
+      SET status = 'expired'
+      FROM locked_holds lh
+      WHERE rh.id = lh.id
+      RETURNING rh.id
+    ),
+    expired_reservations AS (
+      UPDATE reservations r
+      SET status = 'expired'
+      WHERE r.status = 'pending_payment'
+        AND (
+          r.hold_id IN (SELECT id FROM expired_holds)
+          OR EXISTS (
+            SELECT 1 FROM reservation_holds rh2
+            WHERE rh2.id = r.hold_id
+              AND rh2.status = 'expired'
+          )
+        )
+      RETURNING r.id
+    ),
+    expired_intents AS (
+      UPDATE payment_intents pi
+      SET status = 'expired'
+      FROM expired_reservations er
+      WHERE pi.reservation_id = er.id
+        AND pi.status IN ('created', 'pending')
+      RETURNING pi.id
+    )
+    SELECT count(*) INTO v_expired_count FROM expired_holds;
+  END IF;
 
   RETURN v_expired_count;
 END;
@@ -402,9 +474,15 @@ AS $$
 DECLARE
   v_court courts%ROWTYPE;
   v_settings facility_settings%ROWTYPE;
+  v_hours operating_hours%ROWTYPE;
   v_range TSTZRANGE;
+  v_duration_seconds INTEGER;
   v_duration_minutes INTEGER;
+  v_manila_start TIMESTAMP;
   v_manila_date DATE;
+  v_dow SMALLINT;
+  v_open_at TIMESTAMPTZ;
+  v_close_at TIMESTAMPTZ;
   v_expires_at TIMESTAMPTZ;
   v_customer_id UUID;
   v_hold_id UUID;
@@ -419,9 +497,16 @@ BEGIN
     RAISE EXCEPTION 'PAST_BOOKING_REJECTED: Cannot reserve a slot in the past';
   END IF;
 
-  v_duration_minutes := EXTRACT(EPOCH FROM (p_end_at - p_start_at))::INTEGER / 60;
+  v_duration_seconds := EXTRACT(EPOCH FROM (p_end_at - p_start_at))::INTEGER;
+  IF (v_duration_seconds % 60) <> 0 THEN
+    RAISE EXCEPTION 'INVALID_DURATION: Duration must align to whole minutes';
+  END IF;
+  v_duration_minutes := v_duration_seconds / 60;
   v_range := tstzrange(p_start_at, p_end_at, '[)');
-  v_manila_date := (p_start_at AT TIME ZONE 'Asia/Manila')::DATE;
+
+  v_manila_start := p_start_at AT TIME ZONE 'Asia/Manila';
+  v_manila_date := v_manila_start::DATE;
+  v_dow := EXTRACT(DOW FROM v_manila_date)::SMALLINT;
 
   SELECT * INTO v_settings FROM facility_settings fs WHERE fs.facility_id = p_facility_id;
   IF NOT FOUND THEN
@@ -430,6 +515,7 @@ BEGIN
 
   IF v_duration_minutes < v_settings.min_booking_duration_minutes
      OR v_duration_minutes > v_settings.max_booking_duration_minutes
+     OR (v_duration_minutes % v_settings.slot_granularity_minutes) <> 0
   THEN
     RAISE EXCEPTION 'INVALID_DURATION: Duration outside configured bounds';
   END IF;
@@ -438,17 +524,59 @@ BEGIN
     RAISE EXCEPTION 'ADVANCE_LIMIT_EXCEEDED: Booking exceeds max advance booking window';
   END IF;
 
+  -- Database-level operating hours validation (date-specific override precedes weekly schedule)
+  SELECT * INTO v_hours
+  FROM operating_hours oh
+  WHERE oh.facility_id = p_facility_id
+    AND oh.override_date = v_manila_date
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    SELECT * INTO v_hours
+    FROM operating_hours oh
+    WHERE oh.facility_id = p_facility_id
+      AND oh.override_date IS NULL
+      AND oh.day_of_week = v_dow
+    LIMIT 1;
+  END IF;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'OPERATING_HOURS_NOT_CONFIGURED: Facility operating hours are missing for %', v_manila_date;
+  END IF;
+
+  IF v_hours.is_closed THEN
+    RAISE EXCEPTION 'FACILITY_CLOSED: Facility is closed on %', v_manila_date;
+  END IF;
+
+  v_open_at := (v_manila_date + v_hours.open_time) AT TIME ZONE 'Asia/Manila';
+  v_close_at := (v_manila_date + v_hours.close_time) AT TIME ZONE 'Asia/Manila';
+
+  IF p_start_at < v_open_at OR p_end_at > v_close_at THEN
+    RAISE EXCEPTION 'OUTSIDE_OPERATING_HOURS: Requested interval falls outside operating hours (% to % Asia/Manila)',
+      v_hours.open_time, v_hours.close_time;
+  END IF;
+
   SELECT * INTO v_court
   FROM courts c
   WHERE c.facility_id = p_facility_id
     AND c.court_number = p_court_number;
 
-  IF NOT FOUND OR v_court.status <> 'active' THEN
+  IF NOT FOUND THEN
     RAISE EXCEPTION 'COURT_UNAVAILABLE: Court % is not open for bookings', p_court_number;
   END IF;
 
-  -- Serialize concurrent hold attempts on this specific court for the transaction
+  -- Serialize concurrent hold/cancel attempts on this specific court for the transaction
   PERFORM pg_advisory_xact_lock(hashtext('pmb_court_' || v_court.id::text));
+
+  -- Re-read court row with FOR SHARE inside lock to prevent status race conditions
+  SELECT * INTO v_court
+  FROM courts c
+  WHERE c.id = v_court.id
+  FOR SHARE;
+
+  IF NOT FOUND OR v_court.status <> 'active' THEN
+    RAISE EXCEPTION 'COURT_UNAVAILABLE: Court % is not open for bookings', p_court_number;
+  END IF;
 
   -- Clean up any expired holds on this court first (safe without NOW() partial index)
   PERFORM cleanup_expired_holds(v_court.id);
@@ -602,6 +730,9 @@ GRANT EXECUTE ON FUNCTION lookup_booking_secure(TEXT, TEXT) TO service_role;
 
 -- ---------------------------------------------------------------------------
 -- Token-Authenticated Hold Release / Pending Booking Cancellation
+-- Policy: Only unpaid 'pending_payment' holds may be cancelled by customer token.
+-- Confirmed, payment_review_required, or paid reservations are blocked until
+-- facility refund/cancellation policy is explicitly approved and implemented.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION cancel_booking_with_token(
   p_booking_reference TEXT,
@@ -614,9 +745,14 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 DECLARE
+  v_res_id UUID;
+  v_court_id UUID;
   v_res reservations%ROWTYPE;
+  v_has_paid_payment BOOLEAN := false;
 BEGIN
-  SELECT r.* INTO v_res
+  -- 1. Verify token ownership and resolve court without holding row locks across advisory lock acquisition
+  SELECT r.id, r.court_id
+  INTO v_res_id, v_court_id
   FROM reservations r
   LEFT JOIN reservation_holds rh ON rh.id = r.hold_id
   WHERE upper(trim(r.booking_reference)) = upper(trim(p_booking_reference))
@@ -627,7 +763,32 @@ BEGIN
     RETURN false;
   END IF;
 
-  IF v_res.status IN ('cancelled', 'expired', 'completed') THEN
+  -- 2. Acquire consistent per-court transaction advisory lock before cleanup & state mutation
+  PERFORM pg_advisory_xact_lock(hashtext('pmb_court_' || v_court_id::text));
+  PERFORM cleanup_expired_holds(v_court_id);
+
+  -- 3. Lock reservation row and verify current policy eligibility
+  SELECT * INTO v_res
+  FROM reservations r
+  WHERE r.id = v_res_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM payment_intents pi
+    WHERE pi.reservation_id = v_res.id
+      AND (pi.status IN ('paid', 'refund_pending', 'refunded') OR pi.verified_at IS NOT NULL)
+  ) INTO v_has_paid_payment;
+
+  IF v_res.status IN ('confirmed', 'payment_review_required') OR v_has_paid_payment THEN
+    RAISE EXCEPTION 'CUSTOMER_CANCELLATION_FORBIDDEN: Confirmed or paid reservations cannot be cancelled online via customer token';
+  END IF;
+
+  IF v_res.status <> 'pending_payment' THEN
     RETURN false;
   END IF;
 
@@ -644,10 +805,18 @@ BEGIN
       AND status = 'active';
   END IF;
 
+  UPDATE payment_intents
+  SET status = 'cancelled'
+  WHERE reservation_id = v_res.id
+    AND status IN ('created', 'pending');
+
   INSERT INTO booking_audit_logs (facility_id, reservation_id, hold_id, actor_type, event_type, payload)
   VALUES (
     v_res.facility_id, v_res.id, v_res.hold_id, 'guest', 'reservation_cancelled',
-    jsonb_build_object('reason', p_reason)
+    jsonb_build_object(
+      'previous_status', v_res.status,
+      'reason', COALESCE(NULLIF(trim(p_reason), ''), 'Cancelled by customer')
+    )
   );
 
   RETURN true;

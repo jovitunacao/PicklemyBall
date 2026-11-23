@@ -581,7 +581,23 @@ describe('Edge Fail-Closed Schedule & Missing Schema Protection', () => {
       code: 'DATABASE_SCHEMA_ERROR',
     });
   });
+
+  it('ensures InteractiveCourtMap never silently falls back to CourtStatus.AVAILABLE when courtStatuses is empty and maps policy errors cleanly', () => {
+    const mapSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/components/InteractiveCourtMap.tsx'),
+      'utf8',
+    );
+    expect(mapSource).not.toContain('?? CourtStatus.AVAILABLE');
+    expect(mapSource).toContain('UNVERIFIED');
+
+    const cancelFnSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'supabase/functions/booking-cancel/index.ts'),
+      'utf8',
+    );
+    expect(cancelFnSource).toContain('CUSTOMER_CANCELLATION_FORBIDDEN');
+  });
 });
+
 
 
 

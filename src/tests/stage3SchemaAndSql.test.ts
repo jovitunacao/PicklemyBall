@@ -106,9 +106,52 @@ describe('Stage 3 SQL Migrations Static Integrity & Security Audit', () => {
       expect(seedSql).toMatch(new RegExp(`\\(${c},\\s*'`));
     }
   });
+
+  it('hardens cancel_booking_with_token against confirmed or paid cancellations and locks row under court advisory lock', () => {
+    const cancelFn = rlsSql.slice(
+      rlsSql.indexOf('CREATE OR REPLACE FUNCTION cancel_booking_with_token'),
+    );
+    expect(cancelFn).toContain('pg_advisory_xact_lock');
+    expect(cancelFn).toContain('cleanup_expired_holds(v_court_id)');
+    expect(cancelFn).toContain('FOR UPDATE');
+    expect(cancelFn).toContain("pi.status IN ('paid', 'refund_pending', 'refunded')");
+    expect(cancelFn).toContain('CUSTOMER_CANCELLATION_FORBIDDEN');
+    expect(cancelFn).toContain("IF v_res.status <> 'pending_payment' THEN");
+  });
+
+  it('validates weekly operating_hours and date-specific overrides directly inside acquire_court_hold_and_pending_booking', () => {
+    const holdFn = rlsSql.slice(
+      rlsSql.indexOf('CREATE OR REPLACE FUNCTION acquire_court_hold_and_pending_booking'),
+      rlsSql.indexOf('CREATE OR REPLACE FUNCTION lookup_booking_secure'),
+    );
+    expect(holdFn).toContain('oh.override_date = v_manila_date');
+    expect(holdFn).toContain('oh.override_date IS NULL');
+    expect(holdFn).toContain('oh.day_of_week = v_dow');
+    expect(holdFn).toContain('OPERATING_HOURS_NOT_CONFIGURED');
+    expect(holdFn).toContain('FACILITY_CLOSED');
+    expect(holdFn).toContain('OUTSIDE_OPERATING_HOURS');
+    expect(holdFn).toContain('slot_granularity_minutes');
+    expect(holdFn).toContain('FOR SHARE');
+  });
+
+  it('uses deadlock-safe cleanup_expired_holds locking and validates active facility existence in get_public_court_availability', () => {
+    const cleanupFn = rlsSql.slice(
+      rlsSql.indexOf('CREATE OR REPLACE FUNCTION cleanup_expired_holds'),
+      rlsSql.indexOf('CREATE OR REPLACE FUNCTION acquire_court_hold_and_pending_booking'),
+    );
+    expect(cleanupFn).toContain('FOR UPDATE SKIP LOCKED');
+    expect(cleanupFn).toContain('ORDER BY rh.id');
+
+    const availFn = rlsSql.slice(
+      rlsSql.indexOf('CREATE OR REPLACE FUNCTION get_public_court_availability'),
+      rlsSql.indexOf('CREATE OR REPLACE FUNCTION cleanup_expired_holds'),
+    );
+    expect(availFn).toContain('FACILITY_NOT_FOUND');
+    expect(availFn).toContain("res.hold_id IS NULL");
+  });
 });
 
-// Live Integration & Concurrency Tests (only executed when SUPABASE_TEST_URL is provided)
+// Live Integration & Concurrency Tests (requires a real disposable PostgreSQL/Supabase instance via SUPABASE_TEST_URL + SUPABASE_TEST_SERVICE_ROLE_KEY)
 const testUrl = process.env.SUPABASE_TEST_URL?.trim();
 const testServiceKey = process.env.SUPABASE_TEST_SERVICE_ROLE_KEY?.trim();
 
@@ -165,5 +208,69 @@ describe.skipIf(!testUrl || !testServiceKey)(
       expect(successes).toHaveLength(1);
       expect(failures).toHaveLength(1);
     });
+
+    it('enforces operating hours and closed-day overrides at PostgreSQL RPC level', async () => {
+      const admin = getAdmin();
+      const futureDate = new Date(Date.now() + 10 * 86_400_000).toISOString().slice(0, 10);
+      const { error } = await admin.rpc('acquire_court_hold_and_pending_booking', {
+        p_facility_id: '11111111-1111-4111-8111-111111111101',
+        p_court_number: 2,
+        p_start_at: `${futureDate}T14:00:00.000Z`, // 22:00 PHT (at/after close)
+        p_end_at: `${futureDate}T15:00:00.000Z`,   // 23:00 PHT (outside 06:00-22:00 PHT)
+        p_customer_name: 'After Hours Tester',
+        p_customer_mobile: '+639170000002',
+        p_customer_email: 'afterhours@example.com',
+        p_special_requests: null,
+        p_session_key: 'sess-afterhours',
+        p_hourly_rate_centavos: 35000,
+        p_total_centavos: 35000,
+        p_pricing_snapshot: { test: true },
+        p_ownership_token_hash: `own-ah-${Date.now()}`,
+        p_lookup_token_hash: `lkp-ah-${Date.now()}`,
+      });
+      expect(error?.message).toContain('OUTSIDE_OPERATING_HOURS');
+    });
+
+    it('allows cancelling unpaid pending_payment holds via token while blocking confirmed/paid cancellations', async () => {
+      const admin = getAdmin();
+      const futureDate = new Date(Date.now() + 12 * 86_400_000).toISOString().slice(0, 10);
+      const tokenHash = `tok-cancel-${Date.now()}`;
+
+      const { data: created, error: createErr } = await admin.rpc(
+        'acquire_court_hold_and_pending_booking',
+        {
+          p_facility_id: '11111111-1111-4111-8111-111111111101',
+          p_court_number: 3,
+          p_start_at: `${futureDate}T02:00:00.000Z`,
+          p_end_at: `${futureDate}T03:00:00.000Z`,
+          p_customer_name: 'Cancel Policy Tester',
+          p_customer_mobile: '+639170000003',
+          p_customer_email: 'cancel-policy@example.com',
+          p_special_requests: null,
+          p_session_key: 'sess-cancel',
+          p_hourly_rate_centavos: 35000,
+          p_total_centavos: 35000,
+          p_pricing_snapshot: { test: true },
+          p_ownership_token_hash: tokenHash,
+          p_lookup_token_hash: tokenHash,
+        },
+      );
+      expect(createErr).toBeNull();
+      const row = Array.isArray(created) ? created[0] : created;
+
+      // Mark payment intent as paid -> customer cancellation must now be rejected
+      await admin
+        .from('payment_intents')
+        .update({ status: 'paid', verified_at: new Date().toISOString() })
+        .eq('reservation_id', row.reservation_id);
+
+      const { error: paidCancelErr } = await admin.rpc('cancel_booking_with_token', {
+        p_booking_reference: row.booking_reference,
+        p_token_hash: tokenHash,
+        p_reason: 'Attempt cancel after payment',
+      });
+      expect(paidCancelErr?.message).toContain('CUSTOMER_CANCELLATION_FORBIDDEN');
+    });
   },
 );
+
