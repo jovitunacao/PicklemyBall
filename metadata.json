@@ -1,0 +1,6 @@
+{
+  "name": "Pick My Ball – Astoria Regency",
+  "description": "Pickleball court reservation and online payment platform for Pick My Ball at Astoria Regency, Pasonanca Park, Zamboanga City.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
