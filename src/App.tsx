@@ -9,11 +9,11 @@ import {
   RatesPage,
   TermsPolicyPage,
 } from './pages/FacilityPages';
+import { BookCourtPage } from './pages/BookCourtPage';
 import {
   AdminDashboardPlaceholderPage,
   AdminLoginPage,
   AvailabilityPage,
-  BookCourtPage,
   ConfirmationPage,
   LookupPage,
 } from './pages/BookingFlowPages';

@@ -1,123 +1,25 @@
 import React, { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { Calendar, Lock, QrCode, Search } from 'lucide-react';
-import { COURT_STATUS_LEGEND, FACILITY_INFO, SITE_ROUTES } from '../config/facility';
-
-export const BookCourtPage: React.FC = () => {
-  const [selectedDate, setSelectedDate] = useState('2026-11-23');
-  const [startTime, setStartTime] = useState('08:00');
-  const [durationHours, setDurationHours] = useState(1);
-
-  return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 lg:py-14 space-y-8">
-      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 border-b border-slate-200 pb-6">
-        <div>
-          <p className="text-xs font-semibold tracking-wider text-navy-700 uppercase">
-            Stage 1 Route Shell · Stage 2 Target
-          </p>
-          <h1 className="font-display text-3xl sm:text-4xl font-bold text-navy-950 mt-1">
-            Book a Pickleball Court
-          </h1>
-          <p className="text-sm text-slate-600 mt-1">
-            Interactive 14-court SVG floor plan will mount here once Stage 1 is approved and the
-            official site layout image is provided.
-          </p>
-        </div>
-
-        {/* Date / Start Time / Duration Filter Preview */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <div>
-            <label htmlFor="book-date" className="block text-xs font-medium text-slate-600 mb-1">
-              Play Date ({FACILITY_INFO.timezone})
-            </label>
-            <input
-              id="book-date"
-              type="date"
-              value={selectedDate}
-              onChange={(e) => setSelectedDate(e.target.value)}
-              className="w-full min-h-[44px] px-3 rounded-lg border border-slate-300 bg-white text-sm font-mono tabular-nums"
-            />
-          </div>
-          <div>
-            <label htmlFor="book-time" className="block text-xs font-medium text-slate-600 mb-1">
-              Start Time
-            </label>
-            <select
-              id="book-time"
-              value={startTime}
-              onChange={(e) => setStartTime(e.target.value)}
-              className="w-full min-h-[44px] px-3 rounded-lg border border-slate-300 bg-white text-sm font-mono tabular-nums"
-            >
-              {['06:00', '07:00', '08:00', '09:00', '16:00', '17:00', '18:00', '19:00', '20:00'].map(
-                (t) => (
-                  <option key={t} value={t}>
-                    {t} PHT
-                  </option>
-                ),
-              )}
-            </select>
-          </div>
-          <div>
-            <label htmlFor="book-dur" className="block text-xs font-medium text-slate-600 mb-1">
-              Duration
-            </label>
-            <select
-              id="book-dur"
-              value={durationHours}
-              onChange={(e) => setDurationHours(Number(e.target.value))}
-              className="w-full min-h-[44px] px-3 rounded-lg border border-slate-300 bg-white text-sm tabular-nums"
-            >
-              <option value={1}>1 Hour</option>
-              <option value={2}>2 Hours</option>
-              <option value={3}>3 Hours</option>
-            </select>
-          </div>
-        </div>
-      </div>
-
-      {/* Stage 2 Floor Plan Mount Target */}
-      <div className="bg-white border border-slate-200 rounded-xl p-8 sm:p-12 text-center space-y-4">
-        <Calendar className="w-10 h-10 text-navy-800 mx-auto" />
-        <h2 className="font-display text-2xl sm:text-3xl font-bold text-navy-950">
-          Architectural 14-Court Map Ready for Stage 2
-        </h2>
-        <p className="text-sm text-slate-600 max-w-xl mx-auto leading-relaxed">
-          Per development rules, Stage 1 establishes the application foundation and awaits your
-          approval before proceeding to Stage 2. In Stage 2, the uploaded Astoria Regency floor
-          plan (941 × 1600, Scale 1:250) will mount here with all 14 calibrated SVG court polygons
-          (Courts 1–4 horizontal; Courts 5–10 & 11–14 vertical), pinch-to-zoom, and mobile
-          bottom-sheet court selection.
-        </p>
-
-        <div className="pt-4 flex flex-wrap items-center justify-center gap-4 text-xs text-slate-600">
-          {COURT_STATUS_LEGEND.map((status) => (
-            <span key={status.status} className="inline-flex items-center gap-1.5">
-              <span className={`w-3 h-3 rounded-xs border ${status.swatchClass}`} />
-              <span className="font-medium">{status.label}</span>
-            </span>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-};
+import { Lock, QrCode, Search } from 'lucide-react';
+import { FACILITY_INFO, SITE_ROUTES } from '../config/facility';
 
 export const AvailabilityPage: React.FC = () => (
   <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-12 lg:py-16 space-y-6">
     <p className="text-xs font-semibold tracking-wider text-navy-700 uppercase">
-      Stage 1 Foundation · Live Data in Stage 3–4
+      Stage 2 Interactive Map · Simulated Preview
     </p>
     <h1 className="font-display text-4xl font-bold text-navy-950">Court Availability</h1>
     <p className="text-sm sm:text-base text-slate-600 max-w-2xl leading-relaxed">
-      Real-time court availability across all 14 courts will query PostgreSQL half-open time
-      intervals (<code className="font-mono text-xs">[start_at, end_at)</code>) via Supabase in
-      Stages 3 and 4. No availability data is hardcoded.
+      Inspect simulated availability across all 14 courts on the official Astoria Regency
+      architectural site layout. Real-time PostgreSQL interval queries (
+      <code className="font-mono text-xs">[start_at, end_at)</code>) via Supabase will replace the
+      Stage 2 simulator in Stages 3 and 4.
     </p>
     <Link
       to={SITE_ROUTES.book}
-      className="inline-flex items-center justify-center min-h-[44px] px-5 py-2.5 rounded-lg bg-lime-400 text-navy-950 text-sm font-bold hover:bg-lime-300 transition-colors"
+      className="inline-flex items-center justify-center min-h-[44px] px-6 py-2.5 rounded-lg bg-lime-400 text-navy-950 text-sm font-bold hover:bg-lime-300 transition-colors"
     >
-      Go to Booking Workspace
+      Open 14-Court Floor Plan
     </Link>
   </div>
 );
