@@ -748,6 +748,311 @@ describe('QR Check-In Pass Eligibility, Server-Signed Token Isolation & SVG Rend
       expect(rpcRes.data.courtNumber).toBe(4);
     }
   });
+
+  it('enforces fail-closed auth on revoke_qr_checkin_pass & verify_or_redeem_qr_checkin while preserving service_role system revocation', async () => {
+    interface SimSession {
+      pgRole: 'authenticated' | 'service_role' | 'anon';
+      jwtRole: 'authenticated' | 'service_role' | 'anon';
+      authUid: string | null;
+    }
+
+    const staffDir = new Map<
+      string,
+      { id: string; role: 'super_admin' | 'manager' | 'reception_staff'; isActive: boolean }
+    >([
+      ['11111111-1111-4111-8111-000000000001', { id: '11111111-1111-4111-8111-000000000001', role: 'super_admin', isActive: true }],
+      ['11111111-1111-4111-8111-000000000002', { id: '11111111-1111-4111-8111-000000000002', role: 'manager', isActive: true }],
+      ['11111111-1111-4111-8111-000000000003', { id: '11111111-1111-4111-8111-000000000003', role: 'reception_staff', isActive: true }],
+    ]);
+    const nonStaffUid = '22222222-2222-4222-8222-000000000099';
+    const revokedRecords: Array<{ bookingRef: string | null; jti: string | null; permanent: boolean; staffId: string | null }> = [];
+
+    // Simulates the exact PostgreSQL SECURITY DEFINER caller gate implemented in Migration 0005
+    function createSimulatedRpcClient(session: SimSession) {
+      const isServiceRole =
+        session.jwtRole === 'service_role' && session.pgRole === 'service_role';
+
+      return {
+        rpc: async (fn: string, args: Record<string, unknown>) => {
+          if (fn === 'revoke_qr_checkin_pass') {
+            const pStaffId = (args.p_staff_id ?? null) as string | null;
+            const pPermanent = Boolean(args.p_permanent);
+            const pRef = (args.p_booking_reference ?? null) as string | null;
+            const pJti = (args.p_token_jti ?? null) as string | null;
+
+            if (isServiceRole) {
+              if (pStaffId !== null) {
+                const st = staffDir.get(pStaffId);
+                if (!st || !st.isActive) {
+                  return {
+                    data: [{ ok: false, status_code: 403, code: 'FORBIDDEN', error_message: 'Staff ID is not an active staff member.' }],
+                    error: null,
+                  };
+                }
+                if (pPermanent && st.role === 'reception_staff') {
+                  return {
+                    data: [{ ok: false, status_code: 403, code: 'FORBIDDEN', error_message: 'Manager or Super Admin role is required to permanently revoke check-in privileges.' }],
+                    error: null,
+                  };
+                }
+              }
+            } else {
+              if (
+                session.jwtRole !== 'authenticated' ||
+                session.pgRole !== 'authenticated' ||
+                session.authUid === null
+              ) {
+                return {
+                  data: [{ ok: false, status_code: 401, code: 'UNAUTHORIZED', error_message: 'Authenticated staff session or service_role authority is required.' }],
+                  error: null,
+                };
+              }
+              if (pStaffId === null) {
+                return {
+                  data: [{ ok: false, status_code: 403, code: 'FORBIDDEN', error_message: 'p_staff_id is required for authenticated callers and cannot be omitted or NULL.' }],
+                  error: null,
+                };
+              }
+              if (pStaffId !== session.authUid) {
+                return {
+                  data: [{ ok: false, status_code: 403, code: 'FORBIDDEN', error_message: 'Caller identity does not match p_staff_id.' }],
+                  error: null,
+                };
+              }
+              const st = staffDir.get(session.authUid);
+              if (!st || !st.isActive) {
+                return {
+                  data: [{ ok: false, status_code: 403, code: 'FORBIDDEN', error_message: 'Authenticated user is not an active staff member.' }],
+                  error: null,
+                };
+              }
+              if (pPermanent && st.role === 'reception_staff') {
+                return {
+                  data: [{ ok: false, status_code: 403, code: 'FORBIDDEN', error_message: 'Manager or Super Admin role is required to permanently revoke check-in privileges.' }],
+                  error: null,
+                };
+              }
+            }
+
+            revokedRecords.push({
+              bookingRef: pRef,
+              jti: pJti,
+              permanent: pPermanent,
+              staffId: pStaffId,
+            });
+            return {
+              data: [
+                {
+                  ok: true,
+                  status_code: 200,
+                  code: 'OK',
+                  error_message: null,
+                  booking_reference: pRef,
+                  token_jti: pJti,
+                  revoked_at: '2026-11-28T00:20:00.000Z',
+                },
+              ],
+              error: null,
+            };
+          }
+
+          if (fn === 'verify_or_redeem_qr_checkin') {
+            const pStaffId = (args.p_staff_id ?? null) as string | null;
+            if (isServiceRole) {
+              if (pStaffId === null) {
+                return {
+                  data: [{ ok: false, status_code: 401, code: 'UNAUTHORIZED', error_message: 'Staff user ID is required.' }],
+                  error: null,
+                };
+              }
+            } else {
+              if (
+                session.jwtRole !== 'authenticated' ||
+                session.pgRole !== 'authenticated' ||
+                session.authUid === null
+              ) {
+                return {
+                  data: [{ ok: false, status_code: 401, code: 'UNAUTHORIZED', error_message: 'Authenticated staff session or service_role authority is required.' }],
+                  error: null,
+                };
+              }
+              if (pStaffId === null || pStaffId !== session.authUid) {
+                return {
+                  data: [{ ok: false, status_code: 403, code: 'FORBIDDEN', error_message: 'p_staff_id must be non-null and match caller auth.uid().' }],
+                  error: null,
+                };
+              }
+            }
+            const st = staffDir.get(pStaffId);
+            if (!st || !st.isActive) {
+              return {
+                data: [{ ok: false, status_code: 403, code: 'FORBIDDEN', error_message: 'Authenticated user is not an active staff member.' }],
+                error: null,
+              };
+            }
+            return {
+              data: [
+                {
+                  ok: true,
+                  status_code: 200,
+                  code: 'OK',
+                  error_message: null,
+                  consumed: Boolean(args.p_consume),
+                  booking_reference: args.p_booking_reference,
+                  court_number: args.p_court_number,
+                  customer_name: 'Ana Reyes',
+                  reservation_status: 'confirmed',
+                  start_at: '2026-11-28T00:00:00.000Z',
+                  end_at: '2026-11-28T01:00:00.000Z',
+                  checked_in_at: '2026-11-28T00:15:00.000Z',
+                },
+              ],
+              error: null,
+            };
+          }
+
+          return { data: null, error: { message: 'Unknown RPC' } };
+        },
+      } as unknown as Parameters<typeof createSupabaseQrDurabilityStore>[0];
+    }
+
+    // 1. Authenticated non-staff caller omitting / passing NULL p_staff_id MUST be rejected (403 FORBIDDEN)
+    const nonStaffStore = createSupabaseQrDurabilityStore(
+      createSimulatedRpcClient({ pgRole: 'authenticated', jwtRole: 'authenticated', authUid: nonStaffUid }),
+    );
+    const nonStaffNullRevoke = await nonStaffStore.revoke({
+      facilityId: '11111111-1111-4111-8111-111111111101',
+      bookingReference: 'PMB-20261128-TEST',
+      tokenJti: null,
+      reason: 'unauthorized attempt with null p_staff_id',
+      permanent: false,
+      revokedBeforeEpoch: 1795824000,
+      staffUserId: null,
+      nowMs: Date.parse('2026-11-28T00:20:00.000Z'),
+    });
+    expect(nonStaffNullRevoke.ok).toBe(false);
+    if (!nonStaffNullRevoke.ok) {
+      expect(nonStaffNullRevoke.statusCode).toBe(403);
+      expect(nonStaffNullRevoke.code).toBe('FORBIDDEN');
+    }
+
+    // 2. Authenticated non-staff spoofing a manager UUID MUST be rejected (403 FORBIDDEN) on both revoke & redeem
+    const managerUid = '11111111-1111-4111-8111-000000000002';
+    const spoofedRevoke = await nonStaffStore.revoke({
+      facilityId: '11111111-1111-4111-8111-111111111101',
+      bookingReference: 'PMB-20261128-TEST',
+      tokenJti: null,
+      reason: 'spoofed manager uuid',
+      permanent: true,
+      revokedBeforeEpoch: 1795824000,
+      staffUserId: managerUid,
+      nowMs: Date.parse('2026-11-28T00:20:00.000Z'),
+    });
+    expect(spoofedRevoke.ok).toBe(false);
+    if (!spoofedRevoke.ok) {
+      expect(spoofedRevoke.statusCode).toBe(403);
+      expect(spoofedRevoke.code).toBe('FORBIDDEN');
+    }
+
+    const spoofedRedeem = await nonStaffStore.verifyOrRedeem({
+      facilityId: '11111111-1111-4111-8111-111111111101',
+      bookingReference: 'PMB-20261128-TEST',
+      courtNumber: 1,
+      tokenJti: 'jti-1234567890',
+      issuedAtEpoch: 1795823000,
+      expiresAtIso: '2026-11-28T02:00:00.000Z',
+      consume: true,
+      staffUserId: managerUid,
+      nowMs: Date.parse('2026-11-28T00:20:00.000Z'),
+    });
+    expect(spoofedRedeem.ok).toBe(false);
+    if (!spoofedRedeem.ok) {
+      expect(spoofedRedeem.statusCode).toBe(403);
+      expect(spoofedRedeem.code).toBe('FORBIDDEN');
+    }
+
+    // 3. auth.uid() = NULL under authenticated role (or forged JWT claim without pg service_role) is NEVER trusted
+    const nullUidStore = createSupabaseQrDurabilityStore(
+      createSimulatedRpcClient({ pgRole: 'authenticated', jwtRole: 'service_role', authUid: null }),
+    );
+    const nullUidRevoke = await nullUidStore.revoke({
+      facilityId: '11111111-1111-4111-8111-111111111101',
+      bookingReference: 'PMB-20261128-TEST',
+      tokenJti: null,
+      reason: 'forged claim without pg service_role',
+      permanent: true,
+      revokedBeforeEpoch: 1795824000,
+      staffUserId: null,
+      nowMs: Date.parse('2026-11-28T00:20:00.000Z'),
+    });
+    expect(nullUidRevoke.ok).toBe(false);
+    if (!nullUidRevoke.ok) {
+      expect(nullUidRevoke.statusCode).toBe(401);
+      expect(nullUidRevoke.code).toBe('UNAUTHORIZED');
+    }
+
+    const nullUidRedeem = await nullUidStore.verifyOrRedeem({
+      facilityId: '11111111-1111-4111-8111-111111111101',
+      bookingReference: 'PMB-20261128-TEST',
+      courtNumber: 1,
+      tokenJti: 'jti-1234567890',
+      issuedAtEpoch: 1795823000,
+      expiresAtIso: '2026-11-28T02:00:00.000Z',
+      consume: true,
+      staffUserId: managerUid,
+      nowMs: Date.parse('2026-11-28T00:20:00.000Z'),
+    });
+    expect(nullUidRedeem.ok).toBe(false);
+    if (!nullUidRedeem.ok) {
+      expect(nullUidRedeem.statusCode).toBe(401);
+      expect(nullUidRedeem.code).toBe('UNAUTHORIZED');
+    }
+
+    // 4. Authenticated reception_staff with matching p_staff_id cannot permanently revoke (403)
+    const receptionUid = '11111111-1111-4111-8111-000000000003';
+    const receptionStore = createSupabaseQrDurabilityStore(
+      createSimulatedRpcClient({ pgRole: 'authenticated', jwtRole: 'authenticated', authUid: receptionUid }),
+    );
+    const receptionPerm = await receptionStore.revoke({
+      facilityId: '11111111-1111-4111-8111-111111111101',
+      bookingReference: 'PMB-20261128-TEST',
+      tokenJti: null,
+      reason: 'attempt permanent revoke by reception',
+      permanent: true,
+      revokedBeforeEpoch: 1795824000,
+      staffUserId: receptionUid,
+      nowMs: Date.parse('2026-11-28T00:20:00.000Z'),
+    });
+    expect(receptionPerm.ok).toBe(false);
+    if (!receptionPerm.ok) {
+      expect(receptionPerm.statusCode).toBe(403);
+      expect(receptionPerm.code).toBe('FORBIDDEN');
+    }
+    expect(revokedRecords).toHaveLength(0);
+
+    // 5. Genuine service_role system cancellation with p_staff_id = null and p_permanent = true succeeds
+    const serviceRoleClient = createSimulatedRpcClient({
+      pgRole: 'service_role',
+      jwtRole: 'service_role',
+      authUid: null,
+    });
+    const systemCancelRevoke = await revokeQrCheckInTokens({
+      bookingReference: 'PMB-20261128-SYSC',
+      reason: 'reservation_cancelled',
+      permanent: true,
+      adminClient: serviceRoleClient,
+      nowMs: Date.parse('2026-11-28T00:25:00.000Z'),
+    });
+    expect(systemCancelRevoke.ok).toBe(true);
+    expect(revokedRecords).toEqual([
+      {
+        bookingRef: 'PMB-20261128-SYSC',
+        jti: null,
+        permanent: true,
+        staffId: null,
+      },
+    ]);
+  });
 });
 
 describe('Transactional Email Confirmation Builder & Delivery Guardrails', () => {

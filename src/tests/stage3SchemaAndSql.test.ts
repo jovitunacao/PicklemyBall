@@ -185,6 +185,65 @@ describe('Stage 3 SQL Migrations Static Integrity & Security Audit', () => {
     const mig5SearchPaths = qrDurabilitySql.match(/SET search_path = public, pg_temp/g) ?? [];
     expect(mig5SearchPaths).toHaveLength(4);
   });
+
+  it('enforces fail-closed JWT + role authorization across all SECURITY DEFINER functions in Migration 0005', () => {
+    const eligFn = qrDurabilitySql.slice(
+      qrDurabilitySql.indexOf('CREATE OR REPLACE FUNCTION check_qr_checkin_issuance_eligibility'),
+      qrDurabilitySql.indexOf('CREATE OR REPLACE FUNCTION verify_or_redeem_qr_checkin'),
+    );
+    const verifyFn = qrDurabilitySql.slice(
+      qrDurabilitySql.indexOf('CREATE OR REPLACE FUNCTION verify_or_redeem_qr_checkin'),
+      qrDurabilitySql.indexOf('CREATE OR REPLACE FUNCTION revoke_qr_checkin_pass'),
+    );
+    const revokeFn = qrDurabilitySql.slice(
+      qrDurabilitySql.indexOf('CREATE OR REPLACE FUNCTION revoke_qr_checkin_pass'),
+      qrDurabilitySql.indexOf('CREATE OR REPLACE FUNCTION auto_revoke_qr_checkin_on_cancel'),
+    );
+    const triggerFn = qrDurabilitySql.slice(
+      qrDurabilitySql.indexOf('CREATE OR REPLACE FUNCTION auto_revoke_qr_checkin_on_cancel'),
+    );
+
+    // 1. Issuance eligibility: strictly service_role only (both GRANT and internal role check)
+    expect(eligFn).toContain("v_jwt_role = 'service_role' AND v_pg_role = 'service_role'");
+    expect(eligFn).toContain('IF NOT v_is_service_role THEN');
+    expect(eligFn).toContain('GRANT EXECUTE ON FUNCTION check_qr_checkin_issuance_eligibility(UUID, TEXT) TO service_role;');
+    expect(eligFn).not.toContain('TO authenticated');
+
+    // 2. Verify/redeem: must not infer trust from auth.uid() IS NULL
+    expect(verifyFn).toContain("v_jwt_role = 'service_role' AND v_pg_role = 'service_role'");
+    expect(verifyFn).not.toContain('IF v_caller_uid IS NOT NULL AND');
+    expect(verifyFn).toContain("v_jwt_role IS DISTINCT FROM 'authenticated'");
+    expect(verifyFn).toContain("v_pg_role IS DISTINCT FROM 'authenticated'");
+    expect(verifyFn).toContain('OR v_caller_uid IS NULL');
+    expect(verifyFn).toContain('IF p_staff_id IS NULL OR p_staff_id IS DISTINCT FROM v_caller_uid THEN');
+    expect(verifyFn).toContain("AND sp.role IN ('super_admin', 'manager', 'reception_staff')");
+
+    // 3. Revoke pass: fail-closed gate for authenticated callers, p_staff_id NULL strictly limited to genuine service_role
+    expect(revokeFn).toContain("v_jwt_role = 'service_role' AND v_pg_role = 'service_role'");
+    expect(revokeFn).toContain('IF v_is_service_role THEN');
+    const revokeElseBranch = revokeFn.slice(
+      revokeFn.indexOf('ELSE'),
+      revokeFn.indexOf('IF v_target_ref IS NULL AND v_target_jti IS NULL THEN'),
+    );
+    expect(revokeElseBranch).toContain("v_jwt_role IS DISTINCT FROM 'authenticated'");
+    expect(revokeElseBranch).toContain("v_pg_role IS DISTINCT FROM 'authenticated'");
+    expect(revokeElseBranch).toContain('OR v_caller_uid IS NULL');
+    expect(revokeElseBranch).toContain('IF p_staff_id IS NULL THEN');
+    expect(revokeElseBranch).toContain('IF p_staff_id IS DISTINCT FROM v_caller_uid THEN');
+    expect(revokeElseBranch).toContain('WHERE sp.id = v_caller_uid');
+    expect(revokeElseBranch).toContain("AND sp.role IN ('super_admin', 'manager', 'reception_staff')");
+    expect(revokeElseBranch).toContain("IF p_permanent AND v_staff.role = 'reception_staff' THEN");
+
+    // Authorization block in revoke_qr_checkin_pass executes BEFORE target existence check
+    expect(revokeFn.indexOf('IF v_is_service_role THEN')).toBeLessThan(
+      revokeFn.indexOf('IF v_target_ref IS NULL AND v_target_jti IS NULL THEN'),
+    );
+
+    // 4. Cancel trigger function: trigger-only, pinned search_path, revoked from PUBLIC
+    expect(triggerFn).toContain('RETURNS TRIGGER');
+    expect(triggerFn).toContain('REVOKE ALL ON FUNCTION auto_revoke_qr_checkin_on_cancel() FROM PUBLIC;');
+    expect(triggerFn).not.toContain('GRANT EXECUTE');
+  });
 });
 
 // Live Integration & Concurrency Tests (requires a real disposable PostgreSQL/Supabase instance via SUPABASE_TEST_URL + SUPABASE_TEST_SERVICE_ROLE_KEY)

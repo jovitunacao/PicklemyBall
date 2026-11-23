@@ -68,7 +68,7 @@ CREATE POLICY "Staff read qr check-in revocations" ON qr_checkin_revocations
   USING (is_active_staff());
 
 -- ---------------------------------------------------------------------------
--- 3. Issuance Eligibility Guard (Blocks redeemed or permanently revoked bookings)
+-- 3. Issuance Eligibility Guard (Service-Role Only)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION check_qr_checkin_issuance_eligibility(
   p_facility_id UUID,
@@ -84,9 +84,22 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 DECLARE
+  v_pg_role TEXT := current_setting('role', true);
+  v_jwt_role TEXT := COALESCE(
+    NULLIF(current_setting('request.jwt.claim.role', true), ''),
+    NULLIF(NULLIF(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role', ''),
+    NULLIF(auth.role(), '')
+  );
+  v_is_service_role BOOLEAN := (v_jwt_role = 'service_role' AND v_pg_role = 'service_role');
   v_res reservations%ROWTYPE;
   v_has_paid BOOLEAN := false;
 BEGIN
+  IF NOT v_is_service_role THEN
+    RETURN QUERY SELECT false, 'FORBIDDEN'::TEXT,
+      'Service role authorization is required.'::TEXT;
+    RETURN;
+  END IF;
+
   SELECT * INTO v_res
   FROM reservations r
   WHERE r.facility_id = p_facility_id
@@ -152,7 +165,10 @@ GRANT EXECUTE ON FUNCTION check_qr_checkin_issuance_eligibility(UUID, TEXT) TO s
 
 -- ---------------------------------------------------------------------------
 -- 4. Atomic Multi-Instance Verification & Single-Use Check-In Redemption RPC
---    Acquires FOR UPDATE row lock on reservations row before checking/inserting.
+--    Fail-closed auth:
+--      - service_role callers must supply an active staff p_staff_id
+--      - authenticated callers must have non-null auth.uid(), p_staff_id = auth.uid(),
+--        and an active staff_profiles row (never trusting auth.uid() IS NULL)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION verify_or_redeem_qr_checkin(
   p_facility_id UUID,
@@ -184,6 +200,13 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_now TIMESTAMPTZ := now();
+  v_pg_role TEXT := current_setting('role', true);
+  v_jwt_role TEXT := COALESCE(
+    NULLIF(current_setting('request.jwt.claim.role', true), ''),
+    NULLIF(NULLIF(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role', ''),
+    NULLIF(auth.role(), '')
+  );
+  v_is_service_role BOOLEAN := (v_jwt_role = 'service_role' AND v_pg_role = 'service_role');
   v_caller_uid UUID := auth.uid();
   v_staff staff_profiles%ROWTYPE;
   v_res reservations%ROWTYPE;
@@ -193,18 +216,32 @@ DECLARE
   v_existing_redeemed_at TIMESTAMPTZ;
   v_checked_in_at TIMESTAMPTZ := NULL;
 BEGIN
-  IF p_staff_id IS NULL THEN
-    RETURN QUERY SELECT false, 401, 'UNAUTHORIZED'::TEXT, 'Staff user ID is required.'::TEXT,
-      false, p_booking_reference, p_court_number, NULL::TEXT, NULL::reservation_status,
-      NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ;
-    RETURN;
-  END IF;
+  IF v_is_service_role THEN
+    IF p_staff_id IS NULL THEN
+      RETURN QUERY SELECT false, 401, 'UNAUTHORIZED'::TEXT, 'Staff user ID is required.'::TEXT,
+        false, p_booking_reference, p_court_number, NULL::TEXT, NULL::reservation_status,
+        NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ;
+      RETURN;
+    END IF;
+  ELSE
+    IF v_jwt_role IS DISTINCT FROM 'authenticated'
+       OR v_pg_role IS DISTINCT FROM 'authenticated'
+       OR v_caller_uid IS NULL
+    THEN
+      RETURN QUERY SELECT false, 401, 'UNAUTHORIZED'::TEXT,
+        'Authenticated staff session or service_role authority is required.'::TEXT,
+        false, p_booking_reference, p_court_number, NULL::TEXT, NULL::reservation_status,
+        NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ;
+      RETURN;
+    END IF;
 
-  IF v_caller_uid IS NOT NULL AND v_caller_uid IS DISTINCT FROM p_staff_id THEN
-    RETURN QUERY SELECT false, 403, 'FORBIDDEN'::TEXT, 'Caller identity does not match staff_id.'::TEXT,
-      false, p_booking_reference, p_court_number, NULL::TEXT, NULL::reservation_status,
-      NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ;
-    RETURN;
+    IF p_staff_id IS NULL OR p_staff_id IS DISTINCT FROM v_caller_uid THEN
+      RETURN QUERY SELECT false, 403, 'FORBIDDEN'::TEXT,
+        'p_staff_id must be non-null and match caller auth.uid().'::TEXT,
+        false, p_booking_reference, p_court_number, NULL::TEXT, NULL::reservation_status,
+        NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ;
+      RETURN;
+    END IF;
   END IF;
 
   SELECT * INTO v_staff
@@ -382,6 +419,12 @@ GRANT EXECUTE ON FUNCTION verify_or_redeem_qr_checkin(UUID, TEXT, INTEGER, TEXT,
 
 -- ---------------------------------------------------------------------------
 -- 5. Atomic Durable QR Revocation RPC
+--    Fail-closed auth:
+--      - service_role callers may pass p_staff_id NULL for trusted system cancellation,
+--        or non-null p_staff_id (validated against staff_profiles + permanent role rule).
+--      - authenticated callers MUST have non-null auth.uid(), non-null p_staff_id = auth.uid(),
+--        and an active staff_profiles row in ('super_admin', 'manager', 'reception_staff').
+--      - Permanent revocations by staff are limited to manager or super_admin.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION revoke_qr_checkin_pass(
   p_facility_id UUID,
@@ -408,6 +451,13 @@ AS $$
 DECLARE
   v_now TIMESTAMPTZ := now();
   v_epoch BIGINT := COALESCE(p_revoked_before_epoch, FLOOR(EXTRACT(EPOCH FROM v_now))::BIGINT);
+  v_pg_role TEXT := current_setting('role', true);
+  v_jwt_role TEXT := COALESCE(
+    NULLIF(current_setting('request.jwt.claim.role', true), ''),
+    NULLIF(NULLIF(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role', ''),
+    NULLIF(auth.role(), '')
+  );
+  v_is_service_role BOOLEAN := (v_jwt_role = 'service_role' AND v_pg_role = 'service_role');
   v_caller_uid UUID := auth.uid();
   v_staff staff_profiles%ROWTYPE;
   v_res reservations%ROWTYPE;
@@ -416,28 +466,62 @@ DECLARE
   v_target_jti TEXT := NULLIF(trim(COALESCE(p_token_jti, '')), '');
   v_clean_reason TEXT := COALESCE(NULLIF(trim(COALESCE(p_reason, '')), ''), 'Revoked by facility staff');
 BEGIN
-  IF v_target_ref IS NULL AND v_target_jti IS NULL THEN
-    RETURN QUERY SELECT false, 400, 'REVOCATION_TARGET_REQUIRED'::TEXT,
-      'Provide a booking reference or check-in token JTI to revoke.'::TEXT,
-      NULL::TEXT, NULL::TEXT, v_now;
-    RETURN;
-  END IF;
+  IF v_is_service_role THEN
+    IF p_staff_id IS NOT NULL THEN
+      SELECT * INTO v_staff
+      FROM staff_profiles sp
+      WHERE sp.id = p_staff_id
+        AND sp.is_active = true
+        AND sp.role IN ('super_admin', 'manager', 'reception_staff');
 
-  IF p_staff_id IS NOT NULL THEN
-    IF v_caller_uid IS NOT NULL AND v_caller_uid IS DISTINCT FROM p_staff_id THEN
-      RETURN QUERY SELECT false, 403, 'FORBIDDEN'::TEXT, 'Caller identity does not match staff_id.'::TEXT,
+      IF NOT FOUND THEN
+        RETURN QUERY SELECT false, 403, 'FORBIDDEN'::TEXT,
+          'Staff ID is not an active staff member.'::TEXT,
+          v_target_ref, v_target_jti, v_now;
+        RETURN;
+      END IF;
+
+      IF p_permanent AND v_staff.role = 'reception_staff' THEN
+        RETURN QUERY SELECT false, 403, 'FORBIDDEN'::TEXT,
+          'Manager or Super Admin role is required to permanently revoke check-in privileges.'::TEXT,
+          v_target_ref, v_target_jti, v_now;
+        RETURN;
+      END IF;
+    END IF;
+  ELSE
+    IF v_jwt_role IS DISTINCT FROM 'authenticated'
+       OR v_pg_role IS DISTINCT FROM 'authenticated'
+       OR v_caller_uid IS NULL
+    THEN
+      RETURN QUERY SELECT false, 401, 'UNAUTHORIZED'::TEXT,
+        'Authenticated staff session or service_role authority is required.'::TEXT,
+        v_target_ref, v_target_jti, v_now;
+      RETURN;
+    END IF;
+
+    IF p_staff_id IS NULL THEN
+      RETURN QUERY SELECT false, 403, 'FORBIDDEN'::TEXT,
+        'p_staff_id is required for authenticated callers and cannot be omitted or NULL.'::TEXT,
+        v_target_ref, v_target_jti, v_now;
+      RETURN;
+    END IF;
+
+    IF p_staff_id IS DISTINCT FROM v_caller_uid THEN
+      RETURN QUERY SELECT false, 403, 'FORBIDDEN'::TEXT,
+        'Caller identity does not match p_staff_id.'::TEXT,
         v_target_ref, v_target_jti, v_now;
       RETURN;
     END IF;
 
     SELECT * INTO v_staff
     FROM staff_profiles sp
-    WHERE sp.id = p_staff_id
+    WHERE sp.id = v_caller_uid
       AND sp.is_active = true
       AND sp.role IN ('super_admin', 'manager', 'reception_staff');
 
     IF NOT FOUND THEN
-      RETURN QUERY SELECT false, 403, 'FORBIDDEN'::TEXT, 'Authenticated user is not an active staff member.'::TEXT,
+      RETURN QUERY SELECT false, 403, 'FORBIDDEN'::TEXT,
+        'Authenticated user is not an active staff member.'::TEXT,
         v_target_ref, v_target_jti, v_now;
       RETURN;
     END IF;
@@ -448,6 +532,13 @@ BEGIN
         v_target_ref, v_target_jti, v_now;
       RETURN;
     END IF;
+  END IF;
+
+  IF v_target_ref IS NULL AND v_target_jti IS NULL THEN
+    RETURN QUERY SELECT false, 400, 'REVOCATION_TARGET_REQUIRED'::TEXT,
+      'Provide a booking reference or check-in token JTI to revoke.'::TEXT,
+      NULL::TEXT, NULL::TEXT, v_now;
+    RETURN;
   END IF;
 
   IF v_target_ref IS NOT NULL THEN
@@ -523,7 +614,7 @@ REVOKE ALL ON FUNCTION revoke_qr_checkin_pass(UUID, TEXT, TEXT, TEXT, BOOLEAN, B
 GRANT EXECUTE ON FUNCTION revoke_qr_checkin_pass(UUID, TEXT, TEXT, TEXT, BOOLEAN, BIGINT, UUID) TO authenticated, service_role;
 
 -- ---------------------------------------------------------------------------
--- 6. Automatic Permanent QR Revocation on Any Reservation Cancellation
+-- 6. Automatic Permanent QR Revocation on Any Reservation Cancellation (Trigger Only)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION auto_revoke_qr_checkin_on_cancel()
 RETURNS TRIGGER
@@ -555,6 +646,8 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION auto_revoke_qr_checkin_on_cancel() FROM PUBLIC;
 
 DROP TRIGGER IF EXISTS trg_reservations_auto_revoke_qr ON reservations;
 CREATE TRIGGER trg_reservations_auto_revoke_qr
