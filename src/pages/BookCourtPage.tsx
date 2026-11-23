@@ -1,30 +1,131 @@
-import React, { useMemo, useState } from 'react';
-import { Info } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { AlertCircle, Info, Loader2, RefreshCw } from 'lucide-react';
 import { CourtSelectionPanel } from '../components/CourtSelectionPanel';
 import { InteractiveCourtMap } from '../components/InteractiveCourtMap';
 import { FACILITY_INFO } from '../config/facility';
 import {
   formatEndTime,
-  getAllCourtsIntervalStatus,
   SIMULATED_TIME_SLOTS,
+  SimulatedSlotOutcome,
 } from '../data/mockStage2Availability';
+import {
+  addDaysToManilaDate,
+  getInitialManilaSchedule,
+  getManilaTodayDateString,
+  isPastManilaDate,
+  isPastManilaSlot,
+} from '../lib/manilaTime';
+import {
+  AvailabilityCourtItem,
+  fetchIntervalAvailability,
+  subscribeToAvailabilityRealtime,
+} from '../services/bookingApi';
 import { CourtStatus } from '../types/booking';
 
+const MAX_ADVANCE_DAYS = 30;
+
+function mapApiStatusToEnum(
+  status: AvailabilityCourtItem['status'],
+): Exclude<CourtStatus, CourtStatus.SELECTED> {
+  switch (status) {
+    case 'booked':
+      return CourtStatus.BOOKED;
+    case 'held':
+      return CourtStatus.HELD;
+    case 'maintenance':
+      return CourtStatus.MAINTENANCE;
+    default:
+      return CourtStatus.AVAILABLE;
+  }
+}
+
 export const BookCourtPage: React.FC = () => {
-  const [selectedDate, setSelectedDate] = useState('2026-11-23');
-  const [startTime, setStartTime] = useState('18:00');
+  const initialSchedule = useMemo(() => getInitialManilaSchedule(), []);
+  const todayManila = useMemo(() => getManilaTodayDateString(), []);
+  const maxDateManila = useMemo(
+    () => addDaysToManilaDate(todayManila, MAX_ADVANCE_DAYS),
+    [todayManila],
+  );
+
+  const [selectedDate, setSelectedDate] = useState(initialSchedule.date);
+  const [startTime, setStartTime] = useState(initialSchedule.startTime);
   const [durationHours, setDurationHours] = useState(1);
 
   const [selectedCourtNumber, setSelectedCourtNumber] = useState<number | null>(null);
   const [inspectedConflictCourtNumber, setInspectedConflictCourtNumber] = useState<number | null>(
     null,
   );
-  const [bookingPreviewOpen, setBookingPreviewOpen] = useState(false);
 
-  const courtStatuses = useMemo(
-    () => getAllCourtsIntervalStatus(selectedDate, startTime, durationHours),
-    [selectedDate, startTime, durationHours],
-  );
+  const [availabilitySource, setAvailabilitySource] = useState<
+    'supabase_live' | 'simulated_stage2_fallback'
+  >('simulated_stage2_fallback');
+  const [courtStatuses, setCourtStatuses] = useState<Record<number, SimulatedSlotOutcome>>({});
+  const [loadingAvailability, setLoadingAvailability] = useState(true);
+  const [availabilityError, setAvailabilityError] = useState<string | null>(null);
+  const [refreshTick, setRefreshTick] = useState(0);
+
+  const triggerRefresh = useCallback(() => {
+    setRefreshTick((n) => n + 1);
+  }, []);
+
+  // Fetch availability with stale-request cancellation (AbortController)
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoadingAvailability(true);
+    setAvailabilityError(null);
+
+    fetchIntervalAvailability(
+      {
+        date: selectedDate,
+        startTime,
+        durationMinutes: durationHours * 60,
+      },
+      controller.signal,
+    )
+      .then((res) => {
+        setAvailabilitySource(res.source);
+        const map: Record<number, SimulatedSlotOutcome> = {};
+        for (const item of res.courts) {
+          map[item.courtNumber] = {
+            courtNumber: item.courtNumber,
+            status: mapApiStatusToEnum(item.status),
+            reason: item.reason,
+          };
+        }
+        setCourtStatuses(map);
+
+        // Revalidate currently active court against fresh server response
+        setSelectedCourtNumber((prevSelected) => {
+          if (prevSelected === null) return null;
+          if (map[prevSelected]?.status === CourtStatus.AVAILABLE) return prevSelected;
+          setInspectedConflictCourtNumber(prevSelected);
+          return null;
+        });
+      })
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        setAvailabilityError(
+          err instanceof Error ? err.message : 'Unable to check court availability.',
+        );
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setLoadingAvailability(false);
+        }
+      });
+
+    return () => controller.abort();
+  }, [selectedDate, startTime, durationHours, refreshTick]);
+
+  // Automatic 30s refresh + Supabase Realtime listener
+  useEffect(() => {
+    const unsubscribe = subscribeToAvailabilityRealtime(triggerRefresh);
+    const intervalId = window.setInterval(triggerRefresh, 30_000);
+    return () => {
+      unsubscribe();
+      window.clearInterval(intervalId);
+    };
+  }, [triggerRefresh]);
 
   const statusCounts = useMemo(() => {
     const counts = { available: 0, booked: 0, held: 0, maintenance: 0 };
@@ -37,43 +138,33 @@ export const BookCourtPage: React.FC = () => {
     return counts;
   }, [courtStatuses]);
 
-  const revalidateSelectionForInterval = (
-    nextDate: string,
-    nextStart: string,
-    nextDuration: number,
-  ) => {
-    setBookingPreviewOpen(false);
-    const nextStatuses = getAllCourtsIntervalStatus(nextDate, nextStart, nextDuration);
-    const activeCourt = selectedCourtNumber ?? inspectedConflictCourtNumber;
-    if (activeCourt === null) return;
-
-    const outcome = nextStatuses[activeCourt];
-    if (outcome?.status === CourtStatus.AVAILABLE) {
-      setSelectedCourtNumber(activeCourt);
-      setInspectedConflictCourtNumber(null);
-    } else {
-      setSelectedCourtNumber(null);
-      setInspectedConflictCourtNumber(activeCourt);
+  const handleDateChange = (nextDate: string) => {
+    if (!nextDate) return;
+    if (isPastManilaDate(nextDate)) {
+      setAvailabilityError('Past dates are not bookable in Asia/Manila time.');
+      return;
+    }
+    if (nextDate > maxDateManila) {
+      setAvailabilityError(`Bookings are limited to ${MAX_ADVANCE_DAYS} days in advance.`);
+      return;
+    }
+    setSelectedDate(nextDate);
+    // If switching to today and selected startTime has passed, bump to next open slot
+    if (nextDate === todayManila && isPastManilaSlot(nextDate, startTime)) {
+      const nextOpen = SIMULATED_TIME_SLOTS.find((s) => !isPastManilaSlot(nextDate, s));
+      if (nextOpen) setStartTime(nextOpen);
     }
   };
 
-  const handleDateChange = (nextDate: string) => {
-    setSelectedDate(nextDate);
-    revalidateSelectionForInterval(nextDate, startTime, durationHours);
-  };
-
   const handleStartTimeChange = (nextStart: string) => {
+    if (isPastManilaSlot(selectedDate, nextStart)) {
+      setAvailabilityError('Cannot select a start time that has already passed.');
+      return;
+    }
     setStartTime(nextStart);
-    revalidateSelectionForInterval(selectedDate, nextStart, durationHours);
-  };
-
-  const handleDurationChange = (nextDuration: number) => {
-    setDurationHours(nextDuration);
-    revalidateSelectionForInterval(selectedDate, startTime, nextDuration);
   };
 
   const handleSelectCourt = (courtNumber: number) => {
-    setBookingPreviewOpen(false);
     const outcome = courtStatuses[courtNumber];
     if (outcome?.status === CourtStatus.AVAILABLE) {
       setSelectedCourtNumber(courtNumber);
@@ -87,11 +178,10 @@ export const BookCourtPage: React.FC = () => {
   const handleClosePanel = () => {
     setSelectedCourtNumber(null);
     setInspectedConflictCourtNumber(null);
-    setBookingPreviewOpen(false);
   };
 
   const activeCourtNumber = selectedCourtNumber ?? inspectedConflictCourtNumber;
-  const activeOutcome = activeCourtNumber !== null ? courtStatuses[activeCourtNumber] : null;
+  const activeOutcome = activeCourtNumber !== null ? courtStatuses[activeCourtNumber] ?? null : null;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12 space-y-6">
@@ -118,6 +208,15 @@ export const BookCourtPage: React.FC = () => {
             <span className="font-semibold text-slate-600">
               {statusCounts.maintenance} Closed
             </span>
+            <button
+              type="button"
+              onClick={triggerRefresh}
+              disabled={loadingAvailability}
+              className="inline-flex items-center gap-1 text-navy-700 hover:text-navy-950 font-semibold ml-1"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingAvailability ? 'animate-spin' : ''}`} />
+              <span>Refresh</span>
+            </button>
           </div>
         </div>
 
@@ -130,6 +229,8 @@ export const BookCourtPage: React.FC = () => {
             <input
               id="book-date"
               type="date"
+              min={todayManila}
+              max={maxDateManila}
               value={selectedDate}
               onChange={(e) => handleDateChange(e.target.value)}
               className="w-full min-h-[44px] px-3 rounded-lg border border-slate-300 bg-white text-sm font-mono tabular-nums focus:outline-none focus:ring-2 focus:ring-navy-700"
@@ -146,11 +247,14 @@ export const BookCourtPage: React.FC = () => {
               onChange={(e) => handleStartTimeChange(e.target.value)}
               className="w-full min-h-[44px] px-3 rounded-lg border border-slate-300 bg-white text-sm font-mono tabular-nums focus:outline-none focus:ring-2 focus:ring-navy-700"
             >
-              {SIMULATED_TIME_SLOTS.map((slot) => (
-                <option key={slot} value={slot}>
-                  {slot} PHT
-                </option>
-              ))}
+              {SIMULATED_TIME_SLOTS.map((slot) => {
+                const isPast = isPastManilaSlot(selectedDate, slot);
+                return (
+                  <option key={slot} value={slot} disabled={isPast}>
+                    {slot} PHT{isPast ? ' (Past)' : ''}
+                  </option>
+                );
+              })}
             </select>
           </div>
 
@@ -161,7 +265,7 @@ export const BookCourtPage: React.FC = () => {
             <select
               id="book-dur"
               value={durationHours}
-              onChange={(e) => handleDurationChange(Number(e.target.value))}
+              onChange={(e) => setDurationHours(Number(e.target.value))}
               className="w-full min-h-[44px] px-3 rounded-lg border border-slate-300 bg-white text-sm tabular-nums focus:outline-none focus:ring-2 focus:ring-navy-700"
             >
               <option value={1}>1 Hour</option>
@@ -172,19 +276,42 @@ export const BookCourtPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Explicit Stage 2 Simulated Data Notice */}
-      <div className="rounded-xl border border-amber-300 bg-amber-50/80 px-4 py-3 flex items-start gap-3 text-xs text-amber-950">
-        <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-        <p>
-          <span className="font-bold">Simulated Stage 2 Availability:</span> Court statuses and PHP
-          estimates below are deterministic mock data for floor-plan testing. Live Supabase
-          availability, hold locking, and HitPay checkout will connect in Stages 3–5.
-        </p>
-      </div>
+      {/* Availability Source Banner or Error Alert */}
+      {availabilityError ? (
+        <div className="rounded-xl border border-red-300 bg-red-50 px-4 py-3 flex items-center justify-between gap-3 text-xs text-red-950">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+            <span>{availabilityError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={triggerRefresh}
+            className="min-h-[36px] px-3 rounded-md bg-red-700 text-white font-semibold hover:bg-red-800 shrink-0"
+          >
+            Retry
+          </button>
+        </div>
+      ) : availabilitySource === 'simulated_stage2_fallback' ? (
+        <div className="rounded-xl border border-amber-300 bg-amber-50/80 px-4 py-3 flex items-start gap-3 text-xs text-amber-950">
+          <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+          <p>
+            <span className="font-bold">Supabase Not Connected (Simulated Availability Preview):</span>{' '}
+            The architectural floor plan is displaying Stage 2 simulated availability until your
+            Supabase project credentials and Stage 3 migrations are configured. Live guest holds
+            require the Supabase database connection.
+          </p>
+        </div>
+      ) : null}
 
-      {/* Main Split Workspace: Architectural Floor Plan + Responsive Booking Panel */}
+      {/* Main Split Workspace */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        <div className="lg:col-span-7">
+        <div className="lg:col-span-7 relative">
+          {loadingAvailability && Object.keys(courtStatuses).length === 0 && (
+            <div className="flex items-center justify-center py-12 text-sm text-slate-600 gap-2">
+              <Loader2 className="w-5 h-5 animate-spin" />
+              <span>Checking court availability...</span>
+            </div>
+          )}
           <InteractiveCourtMap
             courtStatuses={courtStatuses}
             selectedCourtNumber={selectedCourtNumber}
@@ -197,15 +324,14 @@ export const BookCourtPage: React.FC = () => {
           <CourtSelectionPanel
             courtNumber={activeCourtNumber}
             courtOutcome={activeOutcome}
+            availabilitySource={availabilitySource}
             selectedDate={selectedDate}
             startTime={startTime}
             durationHours={durationHours}
             isSelectedForBooking={selectedCourtNumber !== null}
-            bookingPreviewOpen={bookingPreviewOpen}
             onChangeStartTime={handleStartTimeChange}
-            onChangeDuration={handleDurationChange}
-            onProceedToBooking={() => setBookingPreviewOpen(true)}
-            onResetPreview={() => setBookingPreviewOpen(false)}
+            onChangeDuration={setDurationHours}
+            onRefreshAvailability={triggerRefresh}
             onClosePanel={handleClosePanel}
           />
         </div>
