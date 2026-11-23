@@ -102,6 +102,16 @@ export function createApp() {
   app.use('/api', (req, res, next) => {
     const originHeader = req.headers.origin;
     const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
+    if (process.env.APP_URL) {
+      allowedOrigins.push(process.env.APP_URL.trim().replace(/\/+$/, ''));
+    }
+    const reqHost = req.headers.host;
+    if (reqHost) {
+      const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim() || req.protocol || 'http';
+      allowedOrigins.push(`${proto}://${reqHost}`);
+      allowedOrigins.push(`https://${reqHost}`);
+      allowedOrigins.push(`http://${reqHost}`);
+    }
     res.setHeader('Vary', 'Origin');
 
     if (originHeader && !isOriginAllowed(originHeader, allowedOrigins)) {

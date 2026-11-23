@@ -57,6 +57,7 @@ export const CourtSelectionPanel: React.FC<CourtSelectionPanelProps> = ({
   const [step, setStep] = useState<'inspect' | 'guest_form'>('inspect');
   const [daySlots, setDaySlots] = useState<CourtScheduleSlot[]>([]);
   const [slotsLoading, setSlotsLoading] = useState(false);
+  const [slotsError, setSlotsError] = useState<string | null>(null);
 
   const [quote, setQuote] = useState<PricingQuoteResponse | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
@@ -80,10 +81,12 @@ export const CourtSelectionPanel: React.FC<CourtSelectionPanelProps> = ({
   useEffect(() => {
     if (courtNumber === null) {
       setDaySlots([]);
+      setSlotsError(null);
       return;
     }
     const controller = new AbortController();
     setSlotsLoading(true);
+    setSlotsError(null);
 
     fetchCourtSchedule({ courtNumber, date: selectedDate }, controller.signal)
       .then((res) => {
@@ -91,6 +94,8 @@ export const CourtSelectionPanel: React.FC<CourtSelectionPanelProps> = ({
       })
       .catch((err) => {
         if (err instanceof DOMException && err.name === 'AbortError') return;
+        setDaySlots([]);
+        setSlotsError(err instanceof Error ? err.message : 'Unable to load hourly slots.');
       })
       .finally(() => {
         if (!controller.signal.aborted) setSlotsLoading(false);
@@ -311,6 +316,12 @@ export const CourtSelectionPanel: React.FC<CourtSelectionPanelProps> = ({
                 </span>
               )}
             </div>
+
+            {slotsError && (
+              <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-md px-2.5 py-2">
+                {slotsError}
+              </p>
+            )}
 
             <div className="grid grid-cols-4 gap-1.5 max-h-36 overflow-y-auto pr-1">
               {daySlots.map((slot) => {

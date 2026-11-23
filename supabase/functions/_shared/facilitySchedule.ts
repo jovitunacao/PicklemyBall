@@ -32,6 +32,49 @@ interface OperatingHourRecord {
   is_closed: boolean;
 }
 
+export function classifyDbSchemaError(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  const errMsg = `${error.code ?? ''} ${error.message ?? ''}`;
+  return (
+    error.code === '42883' ||
+    error.code === '42P01' ||
+    error.code === 'PGRST202' ||
+    /does not exist|could not find the function|schema cache/i.test(errMsg)
+  );
+}
+
+export async function getFacilityOperatingBounds(
+  admin: SupabaseClient,
+  dateStr: string,
+): Promise<{
+  openHour: number;
+  closeHour: number;
+  isClosedDay: boolean;
+}> {
+  let openHour = OPERATING_OPEN_HOUR;
+  let closeHour = OPERATING_CLOSE_HOUR;
+  let isClosedDay = false;
+
+  const dow = getManilaDayOfWeek(dateStr);
+  const { data: hoursRows } = await admin
+    .from('operating_hours')
+    .select('day_of_week, override_date, open_time, close_time, is_closed')
+    .eq('facility_id', DEFAULT_FACILITY_ID)
+    .or(`override_date.eq.${dateStr},day_of_week.eq.${dow}`);
+
+  const typedRows = (hoursRows ?? []) as OperatingHourRecord[];
+  const overrideRow = typedRows.find((r) => r.override_date === dateStr);
+  const weeklyRow = typedRows.find((r) => r.day_of_week === dow);
+  const activeHours = overrideRow ?? weeklyRow;
+  if (activeHours) {
+    isClosedDay = activeHours.is_closed;
+    openHour = Math.floor(parseTimeToMinutes(activeHours.open_time) / 60);
+    closeHour = Math.ceil(parseTimeToMinutes(activeHours.close_time) / 60);
+  }
+
+  return { openHour, closeHour, isClosedDay };
+}
+
 export async function validateScheduleAgainstFacility(
   admin: SupabaseClient,
   dateStr: string,

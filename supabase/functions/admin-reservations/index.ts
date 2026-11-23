@@ -1,6 +1,10 @@
 import { handleCorsPreflightOrReject } from '../_shared/cors.ts';
 import { validateScheduleAgainstFacility } from '../_shared/facilitySchedule.ts';
-import { isValidDateString, manilaDateTimeToUtcIso } from '../_shared/manilaTime.ts';
+import {
+  addDaysToManilaDate,
+  isValidDateString,
+  manilaDateTimeToUtcIso,
+} from '../_shared/manilaTime.ts';
 import { calculateEdgePricingQuote, type EdgePricingRuleRow } from '../_shared/pricing.ts';
 import {
   errorResponse,
@@ -51,9 +55,10 @@ Deno.serve(async (req: Request) => {
         .limit(100);
 
       if (dateFilter && isValidDateString(dateFilter)) {
+        const nextDate = addDaysToManilaDate(dateFilter, 1);
         query = query
           .gte('start_at', manilaDateTimeToUtcIso(dateFilter, '00:00'))
-          .lt('start_at', manilaDateTimeToUtcIso(dateFilter, '23:59:59'));
+          .lt('start_at', manilaDateTimeToUtcIso(nextDate, '00:00'));
       }
 
       if (statusFilter) {

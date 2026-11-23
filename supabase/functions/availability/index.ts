@@ -1,12 +1,14 @@
 import { handleCorsPreflightOrReject } from '../_shared/cors.ts';
-import { validateScheduleAgainstFacility } from '../_shared/facilitySchedule.ts';
+import {
+  classifyDbSchemaError,
+  getFacilityOperatingBounds,
+  validateScheduleAgainstFacility,
+} from '../_shared/facilitySchedule.ts';
 import {
   isPastManilaDate,
   isPastManilaSlot,
   isValidDateString,
   manilaDateTimeToUtcIso,
-  OPERATING_CLOSE_HOUR,
-  OPERATING_OPEN_HOUR,
 } from '../_shared/manilaTime.ts';
 import { enforceDistributedRateLimit } from '../_shared/rateLimit.ts';
 import { errorResponse, jsonResponse } from '../_shared/security.ts';
@@ -96,49 +98,85 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      await admin.rpc('cleanup_expired_holds', { p_court_id: null });
+      const { error: cleanupErr } = await admin.rpc('cleanup_expired_holds', { p_court_id: null });
+      if (cleanupErr && classifyDbSchemaError(cleanupErr)) {
+        return errorResponse(
+          500,
+          'DATABASE_SCHEMA_ERROR',
+          'Required Pick My Ball database tables or functions are missing. Run migrations 0001–0004.',
+          headersWithRate,
+        );
+      }
 
+      const bounds = await getFacilityOperatingBounds(admin, date);
       const hours: number[] = [];
-      for (let h = OPERATING_OPEN_HOUR; h < OPERATING_CLOSE_HOUR; h++) {
+      for (let h = bounds.openHour; h < bounds.closeHour; h++) {
         hours.push(h);
       }
 
-      const slots = await Promise.all(
+      const slotResults = await Promise.all(
         hours.map(async (h) => {
           const startTime = `${String(h).padStart(2, '0')}:00`;
           const endTime = `${String(h + 1).padStart(2, '0')}:00`;
           const isPast = isPastManilaSlot(date, startTime);
-          if (isPast) {
+          if (isPast || bounds.isClosedDay) {
             return {
-              startTime,
-              endTime,
-              status: 'maintenance' as const,
-              isPast: true,
+              error: null,
+              slot: {
+                startTime,
+                endTime,
+                status: 'maintenance' as const,
+                isPast,
+              },
             };
           }
 
-          const { data } = await admin.rpc('get_public_court_availability', {
+          const { data, error } = await admin.rpc('get_public_court_availability', {
             p_facility_id: DEFAULT_FACILITY_ID,
             p_start_at: manilaDateTimeToUtcIso(date, startTime),
             p_end_at: manilaDateTimeToUtcIso(date, endTime),
           });
+          if (error) {
+            return { error, slot: null };
+          }
           const row = ((data ?? []) as PublicAvailabilityRow[]).find(
             (r) => r.court_number === courtNumber,
           );
           return {
-            startTime,
-            endTime,
-            status: row?.status ?? ('available' as const),
-            isPast: false,
+            error: null,
+            slot: {
+              startTime,
+              endTime,
+              status: row?.status ?? ('available' as const),
+              isPast: false,
+            },
           };
         }),
       );
+
+      const firstErr = slotResults.find((r) => r.error)?.error;
+      if (firstErr) {
+        if (classifyDbSchemaError(firstErr)) {
+          return errorResponse(
+            500,
+            'DATABASE_SCHEMA_ERROR',
+            'Required Pick My Ball database tables or functions are missing. Run migrations 0001–0004.',
+            headersWithRate,
+          );
+        }
+        return errorResponse(
+          502,
+          'DATABASE_AVAILABILITY_ERROR',
+          'Unable to retrieve hourly court schedule from Supabase.',
+          headersWithRate,
+        );
+      }
 
       return jsonResponse(
         200,
         {
           source: 'supabase_live',
-          slots,
+          slots: slotResults.map((r) => r.slot!),
         },
         headersWithRate,
       );
@@ -182,13 +220,7 @@ Deno.serve(async (req: Request) => {
     });
 
     if (error) {
-      const errMsg = `${error.code ?? ''} ${error.message ?? ''}`;
-      if (
-        error.code === '42883' ||
-        error.code === '42P01' ||
-        error.code === 'PGRST202' ||
-        /does not exist|could not find the function|schema cache/i.test(errMsg)
-      ) {
+      if (classifyDbSchemaError(error)) {
         return errorResponse(
           500,
           'DATABASE_SCHEMA_ERROR',

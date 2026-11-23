@@ -18,6 +18,7 @@ import {
   getSimulatedDayScheduleForCourt,
 } from '../src/data/mockStage2Availability.ts';
 import {
+  addDaysToManilaDate,
   getManilaDayOfWeek,
   isBeyondAdvanceBookingLimit,
   isPastManilaDate,
@@ -586,7 +587,43 @@ export async function getCourtHourlySchedule(params: {
     };
   }
 
-  await admin.rpc('cleanup_expired_holds', { p_court_id: null });
+  const { error: cleanupErr } = await admin.rpc('cleanup_expired_holds', { p_court_id: null });
+  if (cleanupErr) {
+    const errMsg = `${cleanupErr.code ?? ''} ${cleanupErr.message ?? ''}`;
+    if (
+      cleanupErr.code === '42883' ||
+      cleanupErr.code === '42P01' ||
+      cleanupErr.code === 'PGRST202' ||
+      /does not exist|could not find the function|schema cache/i.test(errMsg)
+    ) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required database tables or functions are missing. Run migrations 0001–0004.',
+      };
+    }
+  }
+
+  let openHour = OPERATING_OPEN_HOUR;
+  let closeHour = OPERATING_CLOSE_HOUR;
+  let isClosedDay = false;
+  const dow = getManilaDayOfWeek(params.date);
+  const { data: hoursRows } = await admin
+    .from('operating_hours')
+    .select('day_of_week, override_date, open_time, close_time, is_closed')
+    .eq('facility_id', DEFAULT_FACILITY_ID)
+    .or(`override_date.eq.${params.date},day_of_week.eq.${dow}`);
+
+  const typedHours = (hoursRows ?? []) as OperatingHourRow[];
+  const activeHours =
+    typedHours.find((r) => r.override_date === params.date) ??
+    typedHours.find((r) => r.day_of_week === dow);
+  if (activeHours) {
+    isClosedDay = activeHours.is_closed;
+    openHour = Math.floor(parseMinutes(activeHours.open_time) / 60);
+    closeHour = Math.ceil(parseMinutes(activeHours.close_time) / 60);
+  }
 
   const slots: Array<{
     startTime: string;
@@ -595,20 +632,43 @@ export async function getCourtHourlySchedule(params: {
     isPast: boolean;
   }> = [];
 
-  for (let h = OPERATING_OPEN_HOUR; h < OPERATING_CLOSE_HOUR; h++) {
+  for (let h = openHour; h < closeHour; h++) {
     const startTime = `${String(h).padStart(2, '0')}:00`;
     const endTime = `${String(h + 1).padStart(2, '0')}:00`;
     const isPast = isPastManilaSlot(params.date, startTime);
-    if (isPast) {
-      slots.push({ startTime, endTime, status: 'maintenance', isPast: true });
+    if (isPast || isClosedDay) {
+      slots.push({ startTime, endTime, status: 'maintenance', isPast });
       continue;
     }
 
-    const { data } = await admin.rpc('get_public_court_availability', {
+    const { data, error } = await admin.rpc('get_public_court_availability', {
       p_facility_id: DEFAULT_FACILITY_ID,
       p_start_at: manilaDateTimeToUtcIso(params.date, startTime),
       p_end_at: manilaDateTimeToUtcIso(params.date, endTime),
     });
+    if (error) {
+      const errMsg = `${error.code ?? ''} ${error.message ?? ''}`;
+      if (
+        error.code === '42883' ||
+        error.code === '42P01' ||
+        error.code === 'PGRST202' ||
+        /does not exist|could not find the function|schema cache/i.test(errMsg)
+      ) {
+        return {
+          ok: false,
+          statusCode: 500,
+          code: 'DATABASE_SCHEMA_ERROR',
+          error: 'Required database tables or functions are missing. Run migrations 0001–0004.',
+        };
+      }
+      return {
+        ok: false,
+        statusCode: 502,
+        code: 'DATABASE_AVAILABILITY_ERROR',
+        error: 'Unable to retrieve hourly court schedule from Supabase.',
+      };
+    }
+
     const row = ((data ?? []) as PublicAvailabilityRow[]).find(
       (r) => r.court_number === params.courtNumber,
     );
@@ -901,9 +961,10 @@ export async function adminListReservations(
     .limit(100);
 
   if (dateFilter && isValidDateString(dateFilter)) {
+    const nextDate = addDaysToManilaDate(dateFilter, 1);
     query = query
       .gte('start_at', manilaDateTimeToUtcIso(dateFilter, '00:00'))
-      .lt('start_at', manilaDateTimeToUtcIso(dateFilter, '23:59'));
+      .lt('start_at', manilaDateTimeToUtcIso(nextDate, '00:00'));
   }
 
   const { data, error } = await query;

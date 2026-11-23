@@ -378,10 +378,33 @@ describe('Edge Web Crypto, State Machine, Distributed Rate Limiting & Validation
 });
 
 describe('Frontend Availability Diagnostic Classification (No Silent Fallback)', () => {
-  it('distinguishes database schema errors and network failures without returning simulated data', async () => {
-    const { AvailabilityDiagnosticError, fetchIntervalAvailability } = await import(
-      '../services/bookingApi'
+  it('distinguishes database schema errors, static HTML fallback missing creds, and network failures without returning simulated data', async () => {
+    const {
+      AvailabilityDiagnosticError,
+      fetchIntervalAvailability,
+      adminCreateWalkInBooking,
+      adminFetchMaintenanceBlocks,
+      adminCreateMaintenanceBlockRequest,
+      adminDeactivateMaintenanceBlockRequest,
+      adminCreatePricingRuleRequest,
+      adminUpdatePricingRequest,
+      adminUpsertOperatingHourRequest,
+    } = await import('../services/bookingApi');
+    const { classifyDbSchemaError } = await import(
+      '../../supabase/functions/_shared/facilitySchedule'
     );
+
+    expect(classifyDbSchemaError({ code: '42883', message: 'function does not exist' })).toBe(true);
+    expect(classifyDbSchemaError({ code: 'PGRST202', message: 'schema cache miss' })).toBe(true);
+    expect(classifyDbSchemaError({ code: '23505', message: 'duplicate key' })).toBe(false);
+
+    expect(typeof adminCreateWalkInBooking).toBe('function');
+    expect(typeof adminFetchMaintenanceBlocks).toBe('function');
+    expect(typeof adminCreateMaintenanceBlockRequest).toBe('function');
+    expect(typeof adminDeactivateMaintenanceBlockRequest).toBe('function');
+    expect(typeof adminCreatePricingRuleRequest).toBe('function');
+    expect(typeof adminUpdatePricingRequest).toBe('function');
+    expect(typeof adminUpsertOperatingHourRequest).toBe('function');
 
     const origFetch = globalThis.fetch;
     try {
@@ -403,6 +426,23 @@ describe('Frontend Availability Diagnostic Classification (No Silent Fallback)',
       ).rejects.toMatchObject({
         name: 'AvailabilityDiagnosticError',
         kind: 'database_schema_error',
+      });
+
+      globalThis.fetch = async () =>
+        new Response('<!doctype html><html><body>SPA</body></html>', {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+
+      await expect(
+        fetchIntervalAvailability({
+          date: '2026-11-28',
+          startTime: '08:00',
+          durationMinutes: 60,
+        }),
+      ).rejects.toMatchObject({
+        name: 'AvailabilityDiagnosticError',
+        kind: 'missing_credentials',
       });
 
       globalThis.fetch = async () => {
@@ -430,5 +470,14 @@ describe('Frontend Availability Diagnostic Classification (No Silent Fallback)',
       globalThis.fetch = origFetch;
     }
   });
+
+  it('allows same-origin Express requests matching Host while keeping cross-origin blocked', async () => {
+    const sameOriginRes = await fetch(`${baseUrl}/api/health`, {
+      headers: { Origin: baseUrl },
+    });
+    expect(sameOriginRes.status).toBe(200);
+    expect(sameOriginRes.headers.get('access-control-allow-origin')).toBe(baseUrl);
+  });
 });
+
 

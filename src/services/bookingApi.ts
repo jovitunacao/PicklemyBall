@@ -286,6 +286,15 @@ async function parseJsonResponse<T>(res: Response, isEdgeCall: boolean = false):
           'NON_JSON_EDGE_RESPONSE',
         );
       }
+      const trimmed = rawText.trimStart().toLowerCase();
+      if (contentType.includes('text/html') || trimmed.startsWith('<!doctype') || trimmed.startsWith('<html')) {
+        throw new AvailabilityDiagnosticError(
+          'missing_credentials',
+          'VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY are not configured for this static deployment (no Edge Functions target or local /api backend available).',
+          res.status,
+          'STATIC_SPA_MISSING_SUPABASE_ENV',
+        );
+      }
       throw new AvailabilityDiagnosticError(
         'network_error',
         `Unexpected non-JSON response (${res.status}) from backend.`,
@@ -542,6 +551,74 @@ export async function adminCancelReservationRequest(
   return parseJsonResponse(res, Boolean(edgeBase));
 }
 
+export async function adminCreateWalkInBooking(
+  staffAccessToken: string,
+  payload: CreateGuestHoldPayload,
+): Promise<CreateGuestHoldResponse> {
+  const edgeBase = assertValidEdgeTargetOrThrow();
+  const url = edgeBase ? `${edgeBase}/admin-reservations` : '/api/admin/walk-in';
+  const res = await executeFetch(
+    url,
+    {
+      method: 'POST',
+      headers: buildStaffHeaders(staffAccessToken, true),
+      body: JSON.stringify(edgeBase ? { action: 'walk_in', ...payload } : payload),
+    },
+    Boolean(edgeBase),
+  );
+  return parseJsonResponse<CreateGuestHoldResponse>(res, Boolean(edgeBase));
+}
+
+export async function adminFetchMaintenanceBlocks(
+  staffAccessToken: string,
+): Promise<{ maintenanceBlocks: unknown[] }> {
+  const edgeBase = assertValidEdgeTargetOrThrow();
+  const url = edgeBase ? `${edgeBase}/admin-maintenance` : '/api/admin/maintenance';
+  const res = await executeFetch(
+    url,
+    { headers: buildStaffHeaders(staffAccessToken, false) },
+    Boolean(edgeBase),
+  );
+  return parseJsonResponse(res, Boolean(edgeBase));
+}
+
+export async function adminCreateMaintenanceBlockRequest(
+  staffAccessToken: string,
+  payload: { courtNumber: number; startAtIso: string; endAtIso: string; reason: string },
+): Promise<unknown> {
+  const edgeBase = assertValidEdgeTargetOrThrow();
+  const url = edgeBase ? `${edgeBase}/admin-maintenance` : '/api/admin/maintenance';
+  const res = await executeFetch(
+    url,
+    {
+      method: 'POST',
+      headers: buildStaffHeaders(staffAccessToken, true),
+      body: JSON.stringify(payload),
+    },
+    Boolean(edgeBase),
+  );
+  return parseJsonResponse(res, Boolean(edgeBase));
+}
+
+export async function adminDeactivateMaintenanceBlockRequest(
+  staffAccessToken: string,
+  maintenanceId: string,
+): Promise<{ deactivated: boolean; id: string }> {
+  const edgeBase = assertValidEdgeTargetOrThrow();
+  const url = edgeBase
+    ? `${edgeBase}/admin-maintenance?id=${encodeURIComponent(maintenanceId)}`
+    : `/api/admin/maintenance/${encodeURIComponent(maintenanceId)}`;
+  const res = await executeFetch(
+    url,
+    {
+      method: 'DELETE',
+      headers: buildStaffHeaders(staffAccessToken, false),
+    },
+    Boolean(edgeBase),
+  );
+  return parseJsonResponse(res, Boolean(edgeBase));
+}
+
 export async function adminFetchPricingConfig(
   staffAccessToken: string,
 ): Promise<{ currency: 'PHP'; courts: unknown[]; pricingRules: unknown[] }> {
@@ -550,6 +627,42 @@ export async function adminFetchPricingConfig(
   const res = await executeFetch(
     url,
     { headers: buildStaffHeaders(staffAccessToken, false) },
+    Boolean(edgeBase),
+  );
+  return parseJsonResponse(res, Boolean(edgeBase));
+}
+
+export async function adminCreatePricingRuleRequest(
+  staffAccessToken: string,
+  payload: Record<string, unknown>,
+): Promise<{ pricingRule: unknown }> {
+  const edgeBase = assertValidEdgeTargetOrThrow();
+  const url = edgeBase ? `${edgeBase}/admin-pricing` : '/api/admin/pricing';
+  const res = await executeFetch(
+    url,
+    {
+      method: 'POST',
+      headers: buildStaffHeaders(staffAccessToken, true),
+      body: JSON.stringify(payload),
+    },
+    Boolean(edgeBase),
+  );
+  return parseJsonResponse(res, Boolean(edgeBase));
+}
+
+export async function adminUpdatePricingRequest(
+  staffAccessToken: string,
+  payload: Record<string, unknown>,
+): Promise<unknown> {
+  const edgeBase = assertValidEdgeTargetOrThrow();
+  const url = edgeBase ? `${edgeBase}/admin-pricing` : '/api/admin/pricing';
+  const res = await executeFetch(
+    url,
+    {
+      method: 'PATCH',
+      headers: buildStaffHeaders(staffAccessToken, true),
+      body: JSON.stringify(payload),
+    },
     Boolean(edgeBase),
   );
   return parseJsonResponse(res, Boolean(edgeBase));
@@ -565,6 +678,26 @@ export async function adminFetchOperatingHours(
   const res = await executeFetch(
     url,
     { headers: buildStaffHeaders(staffAccessToken, false) },
+    Boolean(edgeBase),
+  );
+  return parseJsonResponse(res, Boolean(edgeBase));
+}
+
+export async function adminUpsertOperatingHourRequest(
+  staffAccessToken: string,
+  payload: Record<string, unknown>,
+): Promise<{ operatingHour: unknown }> {
+  const edgeBase = assertValidEdgeTargetOrThrow();
+  const url = edgeBase
+    ? `${edgeBase}/admin-operating-hours`
+    : '/api/admin/operating-hours';
+  const res = await executeFetch(
+    url,
+    {
+      method: 'PUT',
+      headers: buildStaffHeaders(staffAccessToken, true),
+      body: JSON.stringify(payload),
+    },
     Boolean(edgeBase),
   );
   return parseJsonResponse(res, Boolean(edgeBase));
