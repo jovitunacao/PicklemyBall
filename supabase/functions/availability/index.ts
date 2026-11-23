@@ -99,16 +99,28 @@ Deno.serve(async (req: Request) => {
       }
 
       const { error: cleanupErr } = await admin.rpc('cleanup_expired_holds', { p_court_id: null });
-      if (cleanupErr && classifyDbSchemaError(cleanupErr)) {
+      if (cleanupErr) {
+        if (classifyDbSchemaError(cleanupErr)) {
+          return errorResponse(
+            500,
+            'DATABASE_SCHEMA_ERROR',
+            'Required Pick My Ball database tables or functions are missing. Run migrations 0001–0004.',
+            headersWithRate,
+          );
+        }
         return errorResponse(
-          500,
-          'DATABASE_SCHEMA_ERROR',
-          'Required Pick My Ball database tables or functions are missing. Run migrations 0001–0004.',
+          502,
+          'DATABASE_AVAILABILITY_ERROR',
+          'Unable to reconcile expired holds in Supabase.',
           headersWithRate,
         );
       }
 
       const bounds = await getFacilityOperatingBounds(admin, date);
+      if (!bounds.ok) {
+        return errorResponse(bounds.statusCode, bounds.code, bounds.error, headersWithRate);
+      }
+
       const hours: number[] = [];
       for (let h = bounds.openHour; h < bounds.closeHour; h++) {
         hours.push(h);
@@ -122,6 +134,7 @@ Deno.serve(async (req: Request) => {
           if (isPast || bounds.isClosedDay) {
             return {
               error: null,
+              missingCourt: false,
               slot: {
                 startTime,
                 endTime,
@@ -137,17 +150,21 @@ Deno.serve(async (req: Request) => {
             p_end_at: manilaDateTimeToUtcIso(date, endTime),
           });
           if (error) {
-            return { error, slot: null };
+            return { error, missingCourt: false, slot: null };
           }
           const row = ((data ?? []) as PublicAvailabilityRow[]).find(
             (r) => r.court_number === courtNumber,
           );
+          if (!row) {
+            return { error: null, missingCourt: true, slot: null };
+          }
           return {
             error: null,
+            missingCourt: false,
             slot: {
               startTime,
               endTime,
-              status: row?.status ?? ('available' as const),
+              status: row.status,
               isPast: false,
             },
           };
@@ -168,6 +185,15 @@ Deno.serve(async (req: Request) => {
           502,
           'DATABASE_AVAILABILITY_ERROR',
           'Unable to retrieve hourly court schedule from Supabase.',
+          headersWithRate,
+        );
+      }
+
+      if (slotResults.some((r) => r.missingCourt)) {
+        return errorResponse(
+          500,
+          'DATABASE_SCHEMA_ERROR',
+          `Court ${courtNumber} is missing from the Supabase courts table. Ensure migration 0003 is applied.`,
           headersWithRate,
         );
       }
@@ -211,7 +237,23 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    await admin.rpc('cleanup_expired_holds', { p_court_id: null });
+    const { error: cleanupErr } = await admin.rpc('cleanup_expired_holds', { p_court_id: null });
+    if (cleanupErr) {
+      if (classifyDbSchemaError(cleanupErr)) {
+        return errorResponse(
+          500,
+          'DATABASE_SCHEMA_ERROR',
+          'Required Pick My Ball database tables or functions are missing. Run migrations 0001–0004.',
+          headersWithRate,
+        );
+      }
+      return errorResponse(
+        502,
+        'DATABASE_AVAILABILITY_ERROR',
+        'Unable to reconcile expired holds in Supabase.',
+        headersWithRate,
+      );
+    }
 
     const { data, error } = await admin.rpc('get_public_court_availability', {
       p_facility_id: DEFAULT_FACILITY_ID,
@@ -237,6 +279,15 @@ Deno.serve(async (req: Request) => {
     }
 
     const rows = (data ?? []) as PublicAvailabilityRow[];
+    if (rows.length !== 14) {
+      return errorResponse(
+        500,
+        'DATABASE_SCHEMA_ERROR',
+        `Expected 14 seeded courts in Supabase but received ${rows.length}. Ensure migrations 0001–0004 are applied.`,
+        headersWithRate,
+      );
+    }
+
     return jsonResponse(
       200,
       {

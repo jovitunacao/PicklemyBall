@@ -93,6 +93,18 @@ function parseMinutes(timeStr: string): number {
   return hh * 60 + (mm || 0);
 }
 
+function classifyDbSchemaError(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  const errMsg = `${error.code ?? ''} ${error.message ?? ''}`;
+  return (
+    error.code === '42883' ||
+    error.code === '42P01' ||
+    error.code === 'PGRST202' ||
+    error.code === 'PGRST205' ||
+    /does not exist|could not find the (?:function|table)|schema cache/i.test(errMsg)
+  );
+}
+
 // Development-default pricing rules mirror migration 0003 when DB is unconfigured
 const DEV_FALLBACK_PRICING_RULES: PricingRuleRow[] = [
   {
@@ -246,31 +258,77 @@ async function validateScheduleAgainstFacility(
   let isClosedDay = false;
 
   if (admin) {
-    const { data: dbSettings } = await admin
+    const { data: dbSettings, error: settingsErr } = await admin
       .from('facility_settings')
       .select('*')
       .eq('facility_id', DEFAULT_FACILITY_ID)
       .maybeSingle<FacilitySettingsRow>();
-    if (dbSettings) {
-      settings = dbSettings;
+    if (settingsErr) {
+      if (classifyDbSchemaError(settingsErr)) {
+        return {
+          ok: false,
+          statusCode: 500,
+          code: 'DATABASE_SCHEMA_ERROR',
+          error: 'Required Pick My Ball facility_settings table is missing. Run migrations 0001–0004.',
+        };
+      }
+      return {
+        ok: false,
+        statusCode: 502,
+        code: 'FACILITY_SETTINGS_QUERY_ERROR',
+        error: 'Unable to load facility settings from Supabase.',
+      };
     }
+    if (!dbSettings) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Facility settings are missing in Supabase. Run migration 0003.',
+      };
+    }
+    settings = dbSettings;
 
     const dow = getManilaDayOfWeek(dateStr);
-    const { data: hoursRows } = await admin
+    const { data: hoursRows, error: hoursErr } = await admin
       .from('operating_hours')
       .select('*')
       .eq('facility_id', DEFAULT_FACILITY_ID)
       .or(`override_date.eq.${dateStr},day_of_week.eq.${dow}`);
 
+    if (hoursErr) {
+      if (classifyDbSchemaError(hoursErr)) {
+        return {
+          ok: false,
+          statusCode: 500,
+          code: 'DATABASE_SCHEMA_ERROR',
+          error: 'Required Pick My Ball operating_hours table is missing. Run migrations 0001–0004.',
+        };
+      }
+      return {
+        ok: false,
+        statusCode: 502,
+        code: 'OPERATING_HOURS_QUERY_ERROR',
+        error: 'Unable to load facility operating hours from Supabase.',
+      };
+    }
+
     const typedRows = (hoursRows ?? []) as OperatingHourRow[];
     const overrideRow = typedRows.find((r) => r.override_date === dateStr);
     const weeklyRow = typedRows.find((r) => r.day_of_week === dow);
     const activeHours = overrideRow ?? weeklyRow;
-    if (activeHours) {
-      isClosedDay = activeHours.is_closed;
-      openMin = parseMinutes(activeHours.open_time);
-      closeMin = parseMinutes(activeHours.close_time);
+    if (!activeHours) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Facility operating hours are not seeded in Supabase. Run migration 0003.',
+      };
     }
+
+    isClosedDay = activeHours.is_closed;
+    openMin = parseMinutes(activeHours.open_time);
+    closeMin = parseMinutes(activeHours.close_time);
   }
 
   if (isClosedDay) {
@@ -396,7 +454,23 @@ export async function getAvailabilityForInterval(params: {
   }
 
   // Expire any stale holds opportunistically before reading availability
-  await admin.rpc('cleanup_expired_holds', { p_court_id: null });
+  const { error: cleanupErr } = await admin.rpc('cleanup_expired_holds', { p_court_id: null });
+  if (cleanupErr) {
+    if (classifyDbSchemaError(cleanupErr)) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required database tables or functions are missing. Run migrations 0001–0004.',
+      };
+    }
+    return {
+      ok: false,
+      statusCode: 502,
+      code: 'DATABASE_AVAILABILITY_ERROR',
+      error: 'Unable to refresh live court holds in Supabase.',
+    };
+  }
 
   const { data, error } = await admin.rpc('get_public_court_availability', {
     p_facility_id: DEFAULT_FACILITY_ID,
@@ -405,13 +479,7 @@ export async function getAvailabilityForInterval(params: {
   });
 
   if (error) {
-    const errMsg = `${error.code ?? ''} ${error.message ?? ''}`;
-    if (
-      error.code === '42883' ||
-      error.code === '42P01' ||
-      error.code === 'PGRST202' ||
-      /does not exist|could not find the function|schema cache/i.test(errMsg)
-    ) {
+    if (classifyDbSchemaError(error)) {
       return {
         ok: false,
         statusCode: 500,
@@ -428,6 +496,15 @@ export async function getAvailabilityForInterval(params: {
   }
 
   const rows = (data ?? []) as PublicAvailabilityRow[];
+  if (rows.length !== 14) {
+    return {
+      ok: false,
+      statusCode: 500,
+      code: 'DATABASE_SCHEMA_ERROR',
+      error: 'Facility court seed records are incomplete or missing (expected 14 courts). Run migration 0003.',
+    };
+  }
+
   return {
     ok: true,
     statusCode: 200,
@@ -503,7 +580,24 @@ export async function getPricingQuoteForCourt(params: {
     .eq('court_number', params.courtNumber)
     .maybeSingle<CourtRow>();
 
-  if (courtErr || !court) {
+  if (courtErr) {
+    if (classifyDbSchemaError(courtErr)) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required Pick My Ball courts table is missing. Run migrations 0001–0004.',
+      };
+    }
+    return {
+      ok: false,
+      statusCode: 502,
+      code: 'PRICING_QUERY_ERROR',
+      error: 'Unable to retrieve court record from Supabase.',
+    };
+  }
+
+  if (!court) {
     return {
       ok: false,
       statusCode: 404,
@@ -512,11 +606,28 @@ export async function getPricingQuoteForCourt(params: {
     };
   }
 
-  const { data: rulesData } = await admin
+  const { data: rulesData, error: rulesErr } = await admin
     .from('pricing_rules')
     .select('*')
     .eq('facility_id', DEFAULT_FACILITY_ID)
     .eq('is_active', true);
+
+  if (rulesErr) {
+    if (classifyDbSchemaError(rulesErr)) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required Pick My Ball pricing_rules table is missing. Run migrations 0001–0004.',
+      };
+    }
+    return {
+      ok: false,
+      statusCode: 502,
+      code: 'PRICING_QUERY_ERROR',
+      error: 'Unable to retrieve pricing rules from Supabase.',
+    };
+  }
 
   const quote = calculateServerPricingQuote({
     courtNumber: court.court_number,
@@ -589,13 +700,7 @@ export async function getCourtHourlySchedule(params: {
 
   const { error: cleanupErr } = await admin.rpc('cleanup_expired_holds', { p_court_id: null });
   if (cleanupErr) {
-    const errMsg = `${cleanupErr.code ?? ''} ${cleanupErr.message ?? ''}`;
-    if (
-      cleanupErr.code === '42883' ||
-      cleanupErr.code === '42P01' ||
-      cleanupErr.code === 'PGRST202' ||
-      /does not exist|could not find the function|schema cache/i.test(errMsg)
-    ) {
+    if (classifyDbSchemaError(cleanupErr)) {
       return {
         ok: false,
         statusCode: 500,
@@ -603,27 +708,54 @@ export async function getCourtHourlySchedule(params: {
         error: 'Required database tables or functions are missing. Run migrations 0001–0004.',
       };
     }
+    return {
+      ok: false,
+      statusCode: 502,
+      code: 'DATABASE_AVAILABILITY_ERROR',
+      error: 'Unable to refresh live court holds in Supabase.',
+    };
   }
 
-  let openHour = OPERATING_OPEN_HOUR;
-  let closeHour = OPERATING_CLOSE_HOUR;
-  let isClosedDay = false;
   const dow = getManilaDayOfWeek(params.date);
-  const { data: hoursRows } = await admin
+  const { data: hoursRows, error: hoursErr } = await admin
     .from('operating_hours')
     .select('day_of_week, override_date, open_time, close_time, is_closed')
     .eq('facility_id', DEFAULT_FACILITY_ID)
     .or(`override_date.eq.${params.date},day_of_week.eq.${dow}`);
 
+  if (hoursErr) {
+    if (classifyDbSchemaError(hoursErr)) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required Pick My Ball operating_hours table is missing. Run migrations 0001–0004.',
+      };
+    }
+    return {
+      ok: false,
+      statusCode: 502,
+      code: 'OPERATING_HOURS_QUERY_ERROR',
+      error: 'Unable to load facility operating hours from Supabase.',
+    };
+  }
+
   const typedHours = (hoursRows ?? []) as OperatingHourRow[];
   const activeHours =
     typedHours.find((r) => r.override_date === params.date) ??
     typedHours.find((r) => r.day_of_week === dow);
-  if (activeHours) {
-    isClosedDay = activeHours.is_closed;
-    openHour = Math.floor(parseMinutes(activeHours.open_time) / 60);
-    closeHour = Math.ceil(parseMinutes(activeHours.close_time) / 60);
+  if (!activeHours) {
+    return {
+      ok: false,
+      statusCode: 500,
+      code: 'DATABASE_SCHEMA_ERROR',
+      error: 'Facility operating hours are not seeded in Supabase. Run migration 0003.',
+    };
   }
+
+  const isClosedDay = activeHours.is_closed;
+  const openHour = Math.floor(parseMinutes(activeHours.open_time) / 60);
+  const closeHour = Math.ceil(parseMinutes(activeHours.close_time) / 60);
 
   const slots: Array<{
     startTime: string;
@@ -647,13 +779,7 @@ export async function getCourtHourlySchedule(params: {
       p_end_at: manilaDateTimeToUtcIso(params.date, endTime),
     });
     if (error) {
-      const errMsg = `${error.code ?? ''} ${error.message ?? ''}`;
-      if (
-        error.code === '42883' ||
-        error.code === '42P01' ||
-        error.code === 'PGRST202' ||
-        /does not exist|could not find the function|schema cache/i.test(errMsg)
-      ) {
+      if (classifyDbSchemaError(error)) {
         return {
           ok: false,
           statusCode: 500,
@@ -672,10 +798,19 @@ export async function getCourtHourlySchedule(params: {
     const row = ((data ?? []) as PublicAvailabilityRow[]).find(
       (r) => r.court_number === params.courtNumber,
     );
+    if (!row) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: `Court ${params.courtNumber} record is missing in Supabase. Run migration 0003.`,
+      };
+    }
+
     slots.push({
       startTime,
       endTime,
-      status: row?.status ?? 'available',
+      status: row.status,
       isPast: false,
     });
   }

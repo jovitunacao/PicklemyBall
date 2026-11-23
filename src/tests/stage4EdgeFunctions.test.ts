@@ -480,4 +480,108 @@ describe('Frontend Availability Diagnostic Classification (No Silent Fallback)',
   });
 });
 
+describe('Edge Fail-Closed Schedule & Missing Schema Protection', () => {
+  it('fails closed when operating_hours or facility_settings queries error or return unseeded empty rows', async () => {
+    const {
+      classifyDbSchemaError,
+      getFacilityOperatingBounds,
+      validateScheduleAgainstFacility,
+    } = await import('../../supabase/functions/_shared/facilitySchedule');
+
+    expect(
+      classifyDbSchemaError({
+        code: 'PGRST205',
+        message: "Could not find the table 'public.operating_hours' in the schema cache",
+      }),
+    ).toBe(true);
+
+    const missingTableAdmin = {
+      from: (table: string) => ({
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => ({
+              data: null,
+              error: {
+                code: 'PGRST205',
+                message: `Could not find the table 'public.${table}' in the schema cache`,
+              },
+            }),
+            or: async () => ({
+              data: null,
+              error: {
+                code: 'PGRST205',
+                message: `Could not find the table 'public.${table}' in the schema cache`,
+              },
+            }),
+          }),
+        }),
+      }),
+    };
+
+    const boundsErr = await getFacilityOperatingBounds(missingTableAdmin as never, '2026-11-28');
+    expect(boundsErr).toMatchObject({
+      ok: false,
+      statusCode: 500,
+      code: 'DATABASE_SCHEMA_ERROR',
+    });
+
+    const scheduleErr = await validateScheduleAgainstFacility(
+      missingTableAdmin as never,
+      '2026-11-28',
+      '08:00',
+      60,
+      new Date('2026-11-23T00:00:00Z'),
+    );
+    expect(scheduleErr).toMatchObject({
+      ok: false,
+      statusCode: 500,
+      code: 'DATABASE_SCHEMA_ERROR',
+    });
+
+    const unseededRowsAdmin = {
+      from: (table: string) => ({
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => ({
+              data:
+                table === 'facility_settings'
+                  ? null
+                  : { id: 'dummy' },
+              error: null,
+            }),
+            or: async () => ({
+              data: [],
+              error: null,
+            }),
+          }),
+        }),
+      }),
+    };
+
+    const boundsUnseeded = await getFacilityOperatingBounds(
+      unseededRowsAdmin as never,
+      '2026-11-28',
+    );
+    expect(boundsUnseeded).toMatchObject({
+      ok: false,
+      statusCode: 500,
+      code: 'DATABASE_SCHEMA_ERROR',
+    });
+
+    const scheduleUnseeded = await validateScheduleAgainstFacility(
+      unseededRowsAdmin as never,
+      '2026-11-28',
+      '08:00',
+      60,
+      new Date('2026-11-23T00:00:00Z'),
+    );
+    expect(scheduleUnseeded).toMatchObject({
+      ok: false,
+      statusCode: 500,
+      code: 'DATABASE_SCHEMA_ERROR',
+    });
+  });
+});
+
+
 

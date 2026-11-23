@@ -39,40 +39,66 @@ export function classifyDbSchemaError(error: { code?: string; message?: string }
     error.code === '42883' ||
     error.code === '42P01' ||
     error.code === 'PGRST202' ||
-    /does not exist|could not find the function|schema cache/i.test(errMsg)
+    error.code === 'PGRST205' ||
+    /does not exist|could not find the (?:function|table)|schema cache/i.test(errMsg)
   );
 }
 
 export async function getFacilityOperatingBounds(
   admin: SupabaseClient,
   dateStr: string,
-): Promise<{
-  openHour: number;
-  closeHour: number;
-  isClosedDay: boolean;
-}> {
-  let openHour = OPERATING_OPEN_HOUR;
-  let closeHour = OPERATING_CLOSE_HOUR;
-  let isClosedDay = false;
-
+): Promise<
+  | {
+      ok: true;
+      openHour: number;
+      closeHour: number;
+      isClosedDay: boolean;
+    }
+  | { ok: false; statusCode: number; code: string; error: string }
+> {
   const dow = getManilaDayOfWeek(dateStr);
-  const { data: hoursRows } = await admin
+  const { data: hoursRows, error: hoursErr } = await admin
     .from('operating_hours')
     .select('day_of_week, override_date, open_time, close_time, is_closed')
     .eq('facility_id', DEFAULT_FACILITY_ID)
     .or(`override_date.eq.${dateStr},day_of_week.eq.${dow}`);
 
+  if (hoursErr) {
+    if (classifyDbSchemaError(hoursErr)) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required Pick My Ball operating_hours table is missing. Run migrations 0001–0004.',
+      };
+    }
+    return {
+      ok: false,
+      statusCode: 502,
+      code: 'OPERATING_HOURS_QUERY_ERROR',
+      error: 'Unable to load facility operating hours from Supabase.',
+    };
+  }
+
   const typedRows = (hoursRows ?? []) as OperatingHourRecord[];
   const overrideRow = typedRows.find((r) => r.override_date === dateStr);
   const weeklyRow = typedRows.find((r) => r.day_of_week === dow);
   const activeHours = overrideRow ?? weeklyRow;
-  if (activeHours) {
-    isClosedDay = activeHours.is_closed;
-    openHour = Math.floor(parseTimeToMinutes(activeHours.open_time) / 60);
-    closeHour = Math.ceil(parseTimeToMinutes(activeHours.close_time) / 60);
+  if (!activeHours) {
+    return {
+      ok: false,
+      statusCode: 500,
+      code: 'DATABASE_SCHEMA_ERROR',
+      error: 'Facility operating hours are not seeded in Supabase. Run migration 0003.',
+    };
   }
 
-  return { openHour, closeHour, isClosedDay };
+  return {
+    ok: true,
+    isClosedDay: activeHours.is_closed,
+    openHour: Math.floor(parseTimeToMinutes(activeHours.open_time) / 60),
+    closeHour: Math.ceil(parseTimeToMinutes(activeHours.close_time) / 60),
+  };
 }
 
 export async function validateScheduleAgainstFacility(
@@ -109,51 +135,79 @@ export async function validateScheduleAgainstFacility(
     };
   }
 
-  let settings: FacilitySettingsRecord = {
-    facility_id: DEFAULT_FACILITY_ID,
-    hold_duration_minutes: 10,
-    max_advance_booking_days: 30,
-    min_booking_duration_minutes: 60,
-    max_booking_duration_minutes: 180,
-    slot_granularity_minutes: 60,
-    allow_guest_checkout: true,
-    deposit_enabled: false,
-    deposit_percent: 100,
-  };
-
-  const { data: dbSettings } = await admin
+  const { data: dbSettings, error: settingsErr } = await admin
     .from('facility_settings')
     .select(
       'facility_id, hold_duration_minutes, max_advance_booking_days, min_booking_duration_minutes, max_booking_duration_minutes, slot_granularity_minutes, allow_guest_checkout, deposit_enabled, deposit_percent',
     )
     .eq('facility_id', DEFAULT_FACILITY_ID)
     .maybeSingle<FacilitySettingsRecord>();
-  if (dbSettings) {
-    settings = dbSettings;
+
+  if (settingsErr) {
+    if (classifyDbSchemaError(settingsErr)) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required Pick My Ball facility_settings table is missing. Run migrations 0001–0004.',
+      };
+    }
+    return {
+      ok: false,
+      statusCode: 502,
+      code: 'FACILITY_SETTINGS_QUERY_ERROR',
+      error: 'Unable to load facility settings from Supabase.',
+    };
   }
 
-  let openMin = OPERATING_OPEN_HOUR * 60;
-  let closeMin = OPERATING_CLOSE_HOUR * 60;
-  let isClosedDay = false;
+  if (!dbSettings) {
+    return {
+      ok: false,
+      statusCode: 500,
+      code: 'DATABASE_SCHEMA_ERROR',
+      error: 'Facility settings are missing in Supabase. Run migration 0003.',
+    };
+  }
+  const settings = dbSettings;
 
   const dow = getManilaDayOfWeek(dateStr);
-  const { data: hoursRows } = await admin
+  const { data: hoursRows, error: hoursErr } = await admin
     .from('operating_hours')
     .select('day_of_week, override_date, open_time, close_time, is_closed')
     .eq('facility_id', DEFAULT_FACILITY_ID)
     .or(`override_date.eq.${dateStr},day_of_week.eq.${dow}`);
 
+  if (hoursErr) {
+    if (classifyDbSchemaError(hoursErr)) {
+      return {
+        ok: false,
+        statusCode: 500,
+        code: 'DATABASE_SCHEMA_ERROR',
+        error: 'Required Pick My Ball operating_hours table is missing. Run migrations 0001–0004.',
+      };
+    }
+    return {
+      ok: false,
+      statusCode: 502,
+      code: 'OPERATING_HOURS_QUERY_ERROR',
+      error: 'Unable to load facility operating hours from Supabase.',
+    };
+  }
+
   const typedRows = (hoursRows ?? []) as OperatingHourRecord[];
   const overrideRow = typedRows.find((r) => r.override_date === dateStr);
   const weeklyRow = typedRows.find((r) => r.day_of_week === dow);
   const activeHours = overrideRow ?? weeklyRow;
-  if (activeHours) {
-    isClosedDay = activeHours.is_closed;
-    openMin = parseTimeToMinutes(activeHours.open_time);
-    closeMin = parseTimeToMinutes(activeHours.close_time);
+  if (!activeHours) {
+    return {
+      ok: false,
+      statusCode: 500,
+      code: 'DATABASE_SCHEMA_ERROR',
+      error: 'Facility operating hours are not seeded in Supabase. Run migration 0003.',
+    };
   }
 
-  if (isClosedDay) {
+  if (activeHours.is_closed) {
     return {
       ok: false,
       statusCode: 400,
@@ -161,6 +215,9 @@ export async function validateScheduleAgainstFacility(
       error: `The facility is closed on ${dateStr}.`,
     };
   }
+
+  const openMin = parseTimeToMinutes(activeHours.open_time);
+  const closeMin = parseTimeToMinutes(activeHours.close_time);
 
   if (isBeyondAdvanceBookingLimit(dateStr, settings.max_advance_booking_days, now)) {
     return {

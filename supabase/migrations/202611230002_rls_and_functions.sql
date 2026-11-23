@@ -178,7 +178,7 @@ CREATE OR REPLACE FUNCTION generate_booking_reference(p_manila_date DATE)
 RETURNS TEXT
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
   v_alphabet CONSTANT TEXT := '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -299,6 +299,21 @@ BEGIN
           AND res.status IN ('confirmed', 'completed', 'payment_review_required')
           AND res.time_slot && v_range
       ) THEN 'Already booked for the selected time.'
+      WHEN EXISTS (
+        SELECT 1 FROM reservations res
+        WHERE res.court_id = c.id
+          AND res.status = 'pending_payment'
+          AND res.time_slot && v_range
+          AND (
+            res.hold_id IS NULL
+            OR EXISTS (
+              SELECT 1 FROM reservation_holds rh
+              WHERE rh.id = res.hold_id
+                AND rh.status = 'active'
+                AND rh.expires_at > now()
+            )
+          )
+      ) THEN 'Temporarily held while another player completes checkout.'
       WHEN EXISTS (
         SELECT 1 FROM reservation_holds rh
         WHERE rh.court_id = c.id

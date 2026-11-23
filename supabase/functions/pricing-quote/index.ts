@@ -1,5 +1,8 @@
 import { handleCorsPreflightOrReject } from '../_shared/cors.ts';
-import { validateScheduleAgainstFacility } from '../_shared/facilitySchedule.ts';
+import {
+  classifyDbSchemaError,
+  validateScheduleAgainstFacility,
+} from '../_shared/facilitySchedule.ts';
 import { calculateEdgePricingQuote, type EdgePricingRuleRow } from '../_shared/pricing.ts';
 import { enforceDistributedRateLimit } from '../_shared/rateLimit.ts';
 import { errorResponse, jsonResponse } from '../_shared/security.ts';
@@ -85,7 +88,19 @@ Deno.serve(async (req: Request) => {
       .eq('court_number', parsed.data.courtNumber)
       .maybeSingle<{ id: string; court_number: number; base_hourly_rate_centavos: number }>();
 
-    if (courtErr || !court) {
+    if (courtErr) {
+      if (classifyDbSchemaError(courtErr)) {
+        return errorResponse(
+          500,
+          'DATABASE_SCHEMA_ERROR',
+          'Required Pick My Ball courts table is missing. Run migrations 0001–0004.',
+          headersWithRate,
+        );
+      }
+      return errorResponse(502, 'COURT_QUERY_ERROR', 'Unable to query court details from Supabase.', headersWithRate);
+    }
+
+    if (!court) {
       return errorResponse(
         404,
         'COURT_NOT_FOUND',
@@ -94,11 +109,23 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const { data: rulesData } = await admin
+    const { data: rulesData, error: rulesErr } = await admin
       .from('pricing_rules')
       .select('*')
       .eq('facility_id', DEFAULT_FACILITY_ID)
       .eq('is_active', true);
+
+    if (rulesErr) {
+      if (classifyDbSchemaError(rulesErr)) {
+        return errorResponse(
+          500,
+          'DATABASE_SCHEMA_ERROR',
+          'Required Pick My Ball pricing_rules table is missing. Run migrations 0001–0004.',
+          headersWithRate,
+        );
+      }
+      return errorResponse(502, 'PRICING_QUERY_ERROR', 'Unable to load server pricing rules.', headersWithRate);
+    }
 
     const quote = calculateEdgePricingQuote({
       courtNumber: court.court_number,

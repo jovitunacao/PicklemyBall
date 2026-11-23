@@ -69,7 +69,7 @@ describe('Stage 3 SQL Migrations Static Integrity & Security Audit', () => {
       const fnName = m[1];
       expect(rlsSql).toContain(`REVOKE ALL ON FUNCTION ${fnName}`);
     }
-    const setSearchPaths = rlsSql.match(/SET search_path = public, pg_temp/g) ?? [];
+    const setSearchPaths = rlsSql.match(/SET search_path = public(?:, extensions)?, pg_temp/g) ?? [];
     expect(setSearchPaths.length).toBeGreaterThanOrEqual(definerMatches.length);
 
     const mig4Defs = [

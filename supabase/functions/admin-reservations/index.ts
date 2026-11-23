@@ -1,5 +1,8 @@
 import { handleCorsPreflightOrReject } from '../_shared/cors.ts';
-import { validateScheduleAgainstFacility } from '../_shared/facilitySchedule.ts';
+import {
+  classifyDbSchemaError,
+  validateScheduleAgainstFacility,
+} from '../_shared/facilitySchedule.ts';
 import {
   addDaysToManilaDate,
   isValidDateString,
@@ -157,22 +160,36 @@ Deno.serve(async (req: Request) => {
           );
         }
 
-        const { data: court } = await admin
+        const { data: court, error: courtErr } = await admin
           .from('courts')
           .select('id, court_number, base_hourly_rate_centavos')
           .eq('facility_id', staff.profile.facility_id || DEFAULT_FACILITY_ID)
           .eq('court_number', input.courtNumber)
           .maybeSingle<{ id: string; court_number: number; base_hourly_rate_centavos: number }>();
 
+        if (courtErr) {
+          if (classifyDbSchemaError(courtErr)) {
+            return errorResponse(500, 'DATABASE_SCHEMA_ERROR', 'Required Pick My Ball courts table is missing.', corsHeaders);
+          }
+          return errorResponse(502, 'COURT_QUERY_ERROR', 'Unable to query court details.', corsHeaders);
+        }
+
         if (!court) {
           return errorResponse(404, 'COURT_NOT_FOUND', `Court ${input.courtNumber} was not found.`, corsHeaders);
         }
 
-        const { data: rulesData } = await admin
+        const { data: rulesData, error: rulesErr } = await admin
           .from('pricing_rules')
           .select('*')
           .eq('facility_id', staff.profile.facility_id || DEFAULT_FACILITY_ID)
           .eq('is_active', true);
+
+        if (rulesErr) {
+          if (classifyDbSchemaError(rulesErr)) {
+            return errorResponse(500, 'DATABASE_SCHEMA_ERROR', 'Required Pick My Ball pricing_rules table is missing.', corsHeaders);
+          }
+          return errorResponse(502, 'PRICING_QUERY_ERROR', 'Unable to load pricing rules.', corsHeaders);
+        }
 
         const quote = calculateEdgePricingQuote({
           courtNumber: court.court_number,

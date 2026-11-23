@@ -1,4 +1,5 @@
 import { handleCorsPreflightOrReject } from '../_shared/cors.ts';
+import { classifyDbSchemaError } from '../_shared/facilitySchedule.ts';
 import { enforceDistributedRateLimit } from '../_shared/rateLimit.ts';
 import { errorResponse, hashSecretToken, jsonResponse } from '../_shared/security.ts';
 import { getEnv, getServiceSupabaseClient } from '../_shared/supabase.ts';
@@ -66,6 +67,14 @@ Deno.serve(async (req: Request) => {
     });
 
     if (error) {
+      if (classifyDbSchemaError(error)) {
+        return errorResponse(
+          500,
+          'DATABASE_SCHEMA_ERROR',
+          'Required Pick My Ball database tables or functions are missing. Run migrations 0001–0004.',
+          headersWithRate,
+        );
+      }
       return errorResponse(
         500,
         'CANCEL_FAILED',
